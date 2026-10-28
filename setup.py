@@ -1525,6 +1525,7 @@ setup(
     scripts=[
         "scripts/serve_qwen38_27b_nvfp4_v100.sh",
         "scripts/serve_flash_next_nvfp4_v100.sh",
+        "scripts/serve_flint_nvfp4_v100_pcie.sh",
     ],
     package_dir={
         "flash_attn_v100": "flash-attention-v100/flash_attn_v100",
