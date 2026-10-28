@@ -281,6 +281,23 @@ _TEXT_GENERATION_EXAMPLE_MODELS = {
     "FalconForCausalLM": _HfExamplesInfo("tiiuae/falcon-7b"),
     "FalconH1ForCausalLM": _HfExamplesInfo("tiiuae/Falcon-H1-0.5B-Base"),
     "FlexOlmoForCausalLM": _HfExamplesInfo("allenai/Flex-reddit-2x7B-1T"),
+    "FlintForCausalLM": _HfExamplesInfo(
+        "RecursiveSI/flint",
+        min_transformers_version="5.0.0",
+        use_original_num_layers=True,
+        # A dense layer, sliding (RoPE) MoE layers and a full (NoPE) MoE layer.
+        hf_overrides={
+            "num_hidden_layers": 4,
+            "layer_types": [
+                "full_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            "no_rope_layer_indices": [0, 3],
+            "mlp_only_layers": [0],
+        },
+    ),
     "GemmaForCausalLM": _HfExamplesInfo("google/gemma-1.1-2b-it"),
     "Gemma2ForCausalLM": _HfExamplesInfo(
         "google/gemma-2-9b", extras={"tiny": "google/gemma-2-2b-it"}
