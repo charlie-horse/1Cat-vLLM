@@ -56,6 +56,10 @@ _REASONING_PARSERS_TO_REGISTER = {
         "deepseek_v3_reasoning_parser",
         "DeepSeekV3ReasoningWithThinkingParser",
     ),
+    "glm47": (
+        "glm47_reasoning_parser",
+        "Glm47ReasoningParser",
+    ),
     "openai_gptoss": (
         "gptoss_reasoning_parser",
         "GptOssReasoningParser",

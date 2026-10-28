@@ -38,3 +38,15 @@ class Glm47MoeModelToolParser(Glm4MoeModelToolParser):
             r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>",
             re.DOTALL,
         )
+
+    def _extract_tool_call_regions(self, text: str) -> list[tuple[str, bool]]:
+        # In a complete zero-argument call (``<tool_call>name</tool_call>``)
+        # no newline or <arg_key> ends the name. Without one, streaming would
+        # never emit this call or any later call. Append a newline to end the
+        # name; the argument builder ignores it.
+        return [
+            (inner + "\n", True)
+            if complete and self._extract_tool_name_from_region(inner) is None
+            else (inner, complete)
+            for inner, complete in super()._extract_tool_call_regions(text)
+        ]
