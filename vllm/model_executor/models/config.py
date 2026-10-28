@@ -203,6 +203,53 @@ def sm70_nvfp4_qpn4_qualified(vllm_config: "VllmConfig") -> bool:
     )
 
 
+# The platform treats both Volta capabilities as SM70 (platforms/cuda.py).
+_SM70_CAPABILITIES = ((7, 0), (7, 2))
+
+FLASH_V100_SINK_HEAD_SIZES = (128,)
+"""Head sizes whose generic Flash-V100 paged prefill and decode apply sinks.
+
+The D256-specialized kernels, XQA, the FP8 prefill bridge and the dense
+prefill kernels have no sink term. Widen this only with a paired
+kernel/quality check.
+"""
+
+
+def flash_v100_supports_sinks() -> bool:
+    """Whether the installed Flash-V100 extension applies learned sinks.
+
+    Reads the ``flash_attn_v100.SUPPORTS_SINKS`` capability flag. The native
+    extension is optional (``flash_v100/ops.py`` imports it lazily), so a
+    missing or unloadable build reports no support.
+    """
+    try:
+        import flash_attn_v100
+    except (ImportError, OSError):
+        return False
+    return bool(getattr(flash_attn_v100, "SUPPORTS_SINKS", False))
+
+
+def sm70_deployment(vllm_config: "VllmConfig") -> bool:
+    """Whether every participating CUDA device is SM70.
+
+    The attention backend choice is engine-wide, so a stage on another
+    architecture keeps the platform's own per-device selection.
+    """
+    from vllm.platforms import current_platform
+    from vllm.platforms import runtime_defaults as _platform_defaults
+
+    if not current_platform.is_cuda():
+        return False
+    devices = _platform_defaults._participating_cuda_device_ids(vllm_config)
+    return bool(devices) and all(
+        any(
+            current_platform.is_device_capability(capability, device_id=device_id)
+            for capability in _SM70_CAPABILITIES
+        )
+        for device_id in devices
+    )
+
+
 class DeepseekV32ForCausalLM(VerifyAndUpdateConfig):
     @classmethod
     def verify_and_update_config(cls, vllm_config: "VllmConfig") -> None:
@@ -224,6 +271,83 @@ class Ernie4_5_VLMoeForConditionalGenerationConfig(VerifyAndUpdateConfig):
         # Ernie4.5-VL conditionally executes text/vision MoE branches, so
         # fast_moe_cold_start can silently produce incorrect execution order.
         vllm_config.compilation_config.fast_moe_cold_start = False
+
+
+def _flash_v100_sink_route_rejection(vllm_config: "VllmConfig") -> str | None:
+    """Why the Flash-V100 sink route cannot serve this engine, or None.
+
+    Mirrors the per-layer admission in ``flash_v100/impl.py`` so that an
+    engine is never routed to a backend whose layers would then fail closed.
+    """
+    import torch
+
+    from vllm.v1.attention.kv_codecs import FP16, resolve_kv_codec
+
+    flash_v100 = getattr(vllm_config.attention_config, "flash_v100", None)
+    if getattr(flash_v100, "enabled", None) is False:
+        return "Flash-V100 automatic selection is disabled"
+    if not flash_v100_supports_sinks():
+        return "the Flash-V100 extension does not report SUPPORTS_SINKS"
+    model_config = vllm_config.model_config
+    if model_config.dtype != torch.float16:
+        return f"Flash-V100 computes in float16, not {model_config.dtype}"
+    head_dim = getattr(model_config.hf_text_config, "head_dim", None)
+    if head_dim not in FLASH_V100_SINK_HEAD_SIZES:
+        return f"Flash-V100 has no sink route for head_dim={head_dim}"
+    cache_dtype = vllm_config.cache_config.cache_dtype
+    if resolve_kv_codec(cache_dtype) is not FP16:
+        return (
+            "the Flash-V100 sink route needs an FP16 KV cache, not "
+            f"kv_cache_dtype={cache_dtype!r}"
+        )
+    if vllm_config.speculative_config is not None:
+        return "the Flash-V100 speculative verification routes do not apply sinks"
+    return None
+
+
+class FlintModelConfig(VerifyAndUpdateConfig):
+    @staticmethod
+    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        """Select an SM70 attention backend that applies the learned sinks.
+
+        Every Flint layer has learned attention sinks. On SM70 the platform
+        prefers FLASH_ATTN_V100, which inherits ``supports_sink()`` from the
+        Triton backend but admits sinks only on its generic D128 paged
+        prefill/decode, and only when the extension reports
+        ``flash_attn_v100.SUPPORTS_SINKS``. Otherwise every layer would select
+        FLASH_ATTN_V100 and fail at its first forward, so TRITON_ATTN is used
+        instead. An explicitly chosen attention backend is left unchanged.
+        """
+        attention_config = vllm_config.attention_config
+        if attention_config.backend is not None or not sm70_deployment(vllm_config):
+            return
+
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+        from vllm.v1.attention.kv_codecs import FP8_E4M3, resolve_kv_codec
+
+        reason = _flash_v100_sink_route_rejection(vllm_config)
+        if reason is None:
+            attention_config.backend = AttentionBackendEnum.FLASH_ATTN_V100
+            logger.info(
+                "Flint on SM70: using FLASH_ATTN_V100, whose generic D128 paged "
+                "prefill and decode apply the learned attention sinks."
+            )
+            return
+
+        attention_config.backend = AttentionBackendEnum.TRITON_ATTN
+        logger.info(
+            "Flint on SM70: using TRITON_ATTN for the learned attention sinks "
+            "because %s.",
+            reason,
+        )
+        cache_dtype = vllm_config.cache_config.cache_dtype
+        if resolve_kv_codec(cache_dtype) is FP8_E4M3:
+            logger.warning(
+                "Flint on SM70 runs TRITON_ATTN with an FP8 E4M3 KV cache "
+                "(kv_cache_dtype=%r), which Triton cannot compile on SM70. "
+                "Use --kv-cache-dtype auto (FP16 KV cache).",
+                cache_dtype,
+            )
 
 
 class Gemma3TextModelConfig(VerifyAndUpdateConfig):
@@ -860,6 +984,7 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "DeepseekV32ForCausalLM": DeepseekV32ForCausalLM,
     "Ernie4_5_VLMoeForConditionalGeneration": Ernie4_5_VLMoeForConditionalGenerationConfig,  # noqa: E501
     "FalconMambaForCausalLM": MambaModelConfig,
+    "FlintForCausalLM": FlintModelConfig,
     "Gemma3TextModel": Gemma3TextModelConfig,
     "Gemma4ForCausalLM": Gemma4Config,
     "Gemma4ForConditionalGeneration": Gemma4Config,

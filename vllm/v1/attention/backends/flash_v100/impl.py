@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import functools
 from dataclasses import fields
 from types import SimpleNamespace
 from typing import Any, cast
@@ -43,9 +44,37 @@ from vllm.v1.attention.ops.sm70_grouped import (
 
 logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
 
+# Whether the generic decode helper threads ``sinks`` itself. Either way the
+# bound native operator (``_bind_sinks``) applies them.
+_DECODE_HELPER_TAKES_SINKS = _ops.callable_accepts_keyword(
+    _decode.DecodeExecutor._call_flash_attn_decode_paged, "sinks"
+)
+
+
+def _bind_sinks(operation, sinks: torch.Tensor):
+    """Pass a layer's learned sinks to a generic native kernel on every call.
+
+    The executors receive the native operators from this implementation, so a
+    bound operator reaches the kernel on every generic route. A caller that
+    passes ``sinks`` keeps its tensor; an explicit ``None`` does not drop them.
+    """
+
+    @functools.wraps(operation)
+    def call(*args, **kwargs):
+        if kwargs.get("sinks") is None:
+            kwargs["sinks"] = sinks
+        return operation(*args, **kwargs)
+
+    return call
+
 
 class FlashAttnV100Impl(TritonAttentionImpl):
     """Flash Attention V100 implementation with explicit fallback policy."""
+
+    # Learned sinks admitted onto the generic paged kernels, else None. The
+    # rejection names why a layer with sinks was not admitted.
+    _flash_v100_sinks: torch.Tensor | None = None
+    _flash_v100_sink_rejection: str | None = None
 
     allow_triton_fallback = _config.ConfigField[bool]("allow_triton_fallback")
     compare_bhmd_out_dir = _config.ConfigField[str | None]("compare_bhmd_out_dir")
@@ -441,7 +470,104 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             self.use_flash_v100_prefill_contig_dense = False
             self.use_flash_v100_prefill_gather_dense = False
 
+        self._admit_flash_v100_sinks(cfg)
+
         self.config = _config.V100AttnConfig.take_legacy_attributes(vars(self))
+
+    def _flash_v100_sink_rejection_reason(self, vllm_config) -> str | None:
+        """Why this layer's learned sinks cannot take the generic routes."""
+        from vllm.model_executor.models import config as qualification
+
+        sinks = self.sinks
+        assert sinks is not None
+        if not qualification.flash_v100_supports_sinks():
+            return "the extension does not report flash_attn_v100.SUPPORTS_SINKS"
+        if self.attn_type != AttentionType.DECODER:
+            return f"attention type {self.attn_type!r} is not decoder attention"
+        if self.head_size not in qualification.FLASH_V100_SINK_HEAD_SIZES:
+            return f"head size {self.head_size} has no generic sink route"
+        if self.kv_codec is not FP16:
+            return f"KV cache dtype {self.kv_cache_dtype!r} is not fp16"
+        if (
+            sinks.dtype != torch.float32
+            or sinks.dim() != 1
+            or not sinks.is_contiguous()
+        ):
+            return f"sinks are not a contiguous fp32 vector ({sinks.dtype})"
+        if not (
+            self.use_flash_v100_prefill_paged
+            and self.use_flash_v100_decode
+            and self.use_decode_scalar_paged
+        ):
+            return "the generic paged prefill/decode routes are unavailable"
+        if getattr(vllm_config, "speculative_config", None) is not None:
+            return "speculative verification routes do not apply sinks"
+        return None
+
+    def _admit_flash_v100_sinks(self, vllm_config) -> None:
+        """Keep a layer with learned sinks on the generic paged kernels.
+
+        Only the generic paged prefill and decode kernels add the sink to the
+        softmax denominator (``flash_attn_v100.SUPPORTS_SINKS``); every other
+        Flash-V100 kernel would silently drop it. An admitted layer therefore
+        disables the other routes once, as the prefix-anchored mask does, and
+        binds its sinks to the two generic operators. A layer that is not
+        admitted keeps the explicit fallback policy of ``forward``.
+        """
+        if self.sinks is None:
+            return
+        reason = self._flash_v100_sink_rejection_reason(vllm_config)
+        if reason is not None:
+            self._flash_v100_sink_rejection = reason
+            logger.info_once(
+                "FLASH_ATTN_V100 cannot apply learned attention sinks here (%s); "
+                "these layers follow the explicit Triton fallback policy.",
+                reason,
+                scope="process",
+            )
+            return
+
+        # Admission requires fp32 and contiguous, so this keeps the parameter
+        # itself: the kernels read the weights loaded after construction.
+        self.sinks = self.sinks.to(dtype=torch.float32).contiguous()
+        self._flash_v100_sinks = self.sinks
+        # Small-query verification: grouped and XQA verifier kernels.
+        self.smallq_decode_max_query_len = 0
+        # Decode bridges through the prefill, WMMA, BHMD and dense kernels.
+        self.use_decode_paged_prefill = False
+        self.use_decode_dense_cache = False
+        self.use_decode_dense_reference = False
+        self.use_decode_xqa = False
+        self.use_smallq_decode_xqa = False
+        # Specialized prefill: split-KV, sparse, dense and the FP8 bridge.
+        self.use_flash_v100_prefill_splitkv = False
+        self.use_flash_v100_prefill_bfla = False
+        self.use_flash_v100_prefill_contig_dense = False
+        self.use_flash_v100_prefill_gather_dense = False
+        self.use_fp8_prefill_bridge = False
+        # The no-prefix dense prefill kernel has no sink term: read the paged
+        # KV cache through the generic paged prefill kernel instead.
+        self.use_prefill_paged_cache = True
+        self.flash_attn_prefill_paged = _bind_sinks(
+            self.flash_attn_prefill_paged, self.sinks
+        )
+        self.flash_attn_decode_paged = _bind_sinks(
+            self.flash_attn_decode_paged, self.sinks
+        )
+        logger.info_once(
+            "FLASH_ATTN_V100 applies learned attention sinks through the "
+            "generic paged prefill and decode kernels (head size %d); the "
+            "dense, split-KV, sparse, XQA and small-query routes are disabled "
+            "for these layers.",
+            self.head_size,
+            scope="process",
+        )
+
+    def _decode_helper_sink_kwargs(self) -> dict[str, torch.Tensor]:
+        sinks = self._flash_v100_sinks
+        if sinks is None or not _DECODE_HELPER_TAKES_SINKS:
+            return {}
+        return {"sinks": sinks}
 
     _small_tensor_list = staticmethod(_debug_compare.small_tensor_list)
 
@@ -481,7 +607,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             and self.attn_type == AttentionType.DECODER
             and self.alibi_slopes is None
             and self.logits_soft_cap == 0
-            and self.sinks is None
+            and (self.sinks is None or self._flash_v100_sinks is not None)
             and supported_kv_dtype
         )
 
@@ -575,6 +701,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             partition_size_hint=partition_size_hint,
             anchor_lens=anchor_lens,
             anchored_window=anchored_window,
+            **self._decode_helper_sink_kwargs(),
         )
 
     def _new_comparison_executor(self):
