@@ -1132,10 +1132,27 @@ def flash_attn_decode_paged(
     anchor_lens: torch.Tensor | None = None,
     anchored_window: int = 0,
     *,
+    sinks: torch.Tensor | None = None,
     _runtime=None,
 ):
+    """Paged decode; ``sinks`` adds learned attention sinks.
+
+    ``sinks`` holds one fp32 value per query head of ``q`` (natural-log
+    units, as the Triton backend's ``sinks``): each softmax denominator
+    gains ``exp(sink)`` with no value row. ``None`` keeps the sink-free
+    kernels.
+    """
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
+
+    native = _runtime.native if _runtime is not None else flash_attn_v100_cuda
+    if sinks is not None:
+        _validate_decode_sinks(sinks, q)
+        if not hasattr(native, "decode_paged_sinks_fwd"):
+            raise RuntimeError(
+                "Rebuild Flash-V100: this extension has no paged decode "
+                "attention-sink entry point (decode_paged_sinks_fwd)"
+            )
 
     e4m3_fp32 = kv_cache_dtype in ("fp8", "fp8_e4m3")
     if e4m3_fp32 and not flash_attn_grouped_e4m3_fp32_available():
@@ -1204,9 +1221,7 @@ def flash_attn_decode_paged(
         )
     )
 
-    return (
-        _runtime.native if _runtime is not None else flash_attn_v100_cuda
-    ).decode_paged_fwd(
+    native_args = (
         q,
         k_cache,
         v_cache,
@@ -1228,6 +1243,30 @@ def flash_attn_decode_paged(
         anchor_lens,
         int(anchored_window),
     )
+    if sinks is None:
+        return native.decode_paged_fwd(*native_args)
+    return native.decode_paged_sinks_fwd(*native_args, sinks)
+
+
+def _validate_decode_sinks(sinks: torch.Tensor, q: torch.Tensor) -> None:
+    """Metadata-only checks: no host sync, copy or allocation per call."""
+    if not isinstance(sinks, torch.Tensor):
+        raise TypeError(f"sinks must be a torch.Tensor, got {type(sinks)!r}")
+    if sinks.dtype != torch.float32:
+        raise TypeError(f"sinks must be float32, got {sinks.dtype}")
+    if sinks.dim() != 1 or sinks.shape[0] != q.shape[1]:
+        raise ValueError(
+            f"sinks must have shape [{q.shape[1]}] (one per query head), "
+            f"got {tuple(sinks.shape)}"
+        )
+    if sinks.device != q.device:
+        raise ValueError(f"sinks must be on {q.device}, got {sinks.device}")
+    if not sinks.is_contiguous():
+        raise ValueError("sinks must be contiguous")
+
+
+def flash_attn_decode_paged_sinks_available() -> bool:
+    return hasattr(flash_attn_v100_cuda, "decode_paged_sinks_fwd")
 
 
 def flash_attn_decode_paged_xqa_available() -> bool:

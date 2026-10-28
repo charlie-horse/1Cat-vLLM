@@ -23,6 +23,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "FlashAttention-2 Backward Pass (Volta)");
   m.def("decode_paged_fwd", &flash_attention_decode_paged,
         "FlashAttention decode over paged KV cache (Volta)");
+  m.def("decode_paged_sinks_fwd", &flash_attention_decode_paged_sinks,
+        "FlashAttention decode over paged KV cache with optional learned "
+        "attention sinks (Volta)");
   m.def("decode_paged_xqa_fwd", &flash_attention_decode_paged_xqa,
         "FlashAttention XQA decode over paged KV cache (Volta)");
   m.def("decode_paged_xqa_staged_fwd", &flash_attention_decode_paged_xqa_staged,
@@ -108,6 +111,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         flash_v100::policy::with_policy(&flash_attention_backward));
   m.def("decode_paged_fwd_configured",
         flash_v100::policy::with_policy(&flash_attention_decode_paged));
+  m.def("decode_paged_sinks_fwd_configured",
+        flash_v100::policy::with_policy(&flash_attention_decode_paged_sinks));
   m.def("decode_paged_xqa_fwd_configured",
         flash_v100::policy::with_policy(&flash_attention_decode_paged_xqa));
   m.def("decode_paged_xqa_staged_fwd_configured",

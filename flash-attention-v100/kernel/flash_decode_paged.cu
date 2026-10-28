@@ -2794,7 +2794,7 @@ __global__ void flash_attention_decode_reduce_kernel(
     const int64_t stats_stride1, const int64_t out_stride0,
     const int64_t out_stride1, const int route_partition_size_begin,
     const int route_seq_len_begin, const int route_seq_len_end,
-    const int route_seq_len_final) {
+    const int route_seq_len_final, const float* __restrict__ sinks) {
   const int batch_idx = blockIdx.x;
   const int head_idx = blockIdx.y;
 
@@ -2845,7 +2845,14 @@ __global__ void flash_attention_decode_reduce_kernel(
     max_shared[i] = m;
     local_max = fmaxf(local_max, m);
   }
-  const float global_max = block_reduce_max<kWarpsPerBlock>(local_max);
+  const float block_max = block_reduce_max<kWarpsPerBlock>(local_max);
+  // Learned attention sink (natural-log units, the scaled-score domain of
+  // max_logits): one extra softmax denominator term exp(sink) with no value
+  // row. Folding it into the reference max keeps exp() in range. A null
+  // pointer leaves the sink-free reduction unchanged.
+  const float sink = sinks != nullptr ? sinks[head_idx] : 0.f;
+  const float global_max =
+      sinks != nullptr ? fmaxf(block_max, sink) : block_max;
 
   float local_sum = 0.f;
   for (int i = threadIdx.x; i < num_partitions; i += blockDim.x) {
@@ -2857,7 +2864,10 @@ __global__ void flash_attention_decode_reduce_kernel(
     weight_shared[i] = weight;
     local_sum += weight;
   }
-  const float global_sum = block_reduce_sum<kWarpsPerBlock>(local_sum);
+  float global_sum = block_reduce_sum<kWarpsPerBlock>(local_sum);
+  if (sinks != nullptr) {
+    global_sum += __expf(sink - global_max);
+  }
   const float inv_global_sum = global_sum > 0.f ? 1.f / global_sum : 0.f;
   __syncthreads();
 
@@ -3551,7 +3561,11 @@ void launch_flash_attention_decode_paged(
     cudaStream_t stream, const int route_seq_len_begin = 0,
     const int route_seq_len_end = 0, const int route_seq_len_final = 0,
     const bool launch_reduce = true, const int* anchor_lens = nullptr,
-    const int anchored_window = 0) {
+    const int anchored_window = 0, const float* sinks = nullptr) {
+  // Sinks enter only in the cross-partition reducer below, so a caller that
+  // reduces the partials itself cannot drop them silently.
+  TORCH_CHECK(launch_reduce || sinks == nullptr,
+              "attention sinks require the generic decode reducer");
   const int batch_size = q.size(0);
   const int num_heads_q = q.size(1);
   const int num_heads_kv = k_cache.size(2);
@@ -3629,7 +3643,7 @@ void launch_flash_attention_decode_paged(
           reinterpret_cast<__half*>(out.data_ptr<at::Half>()), batch_size,
           max_num_partitions, num_heads_q, tmp_out.stride(0), tmp_out.stride(1),
           tmp_out.stride(2), max_logits.stride(0), max_logits.stride(1),
-          out.stride(0), out.stride(1), 0, 0, 0, 0);
+          out.stride(0), out.stride(1), 0, 0, 0, 0, sinks);
 }
 
 template <int PARTITION_SIZE, int SEQ_LEN_ROUTE = kXQARouteAllSeqLens,
@@ -3811,7 +3825,8 @@ void launch_flash_attention_decode_paged_xqa_tc_256_wide(
             tmp_out.stride(1), tmp_out.stride(2), max_logits.stride(0),
             max_logits.stride(1), out.stride(0), out.stride(1),
             route_seq_len_end > 0 ? route_seq_len_end : route_seq_len_begin,
-            route_seq_len_begin, route_seq_len_end, route_seq_len_final);
+            route_seq_len_begin, route_seq_len_end, route_seq_len_final,
+            nullptr);
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -3985,7 +4000,8 @@ void launch_flash_attention_decode_paged_xqa_tc_256_staged(
             reinterpret_cast<__half*>(out.data_ptr<at::Half>()), batch_size,
             launch_num_partitions, num_heads_q, tmp_out.stride(0),
             tmp_out.stride(1), tmp_out.stride(2), max_logits.stride(0),
-            max_logits.stride(1), out.stride(0), out.stride(1), 0, 0, 0, 0);
+            max_logits.stride(1), out.stride(0), out.stride(1), 0, 0, 0, 0,
+            nullptr);
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -4940,7 +4956,7 @@ at::Tensor flash_attention_grouped_sparse_page4(
   return out;
 }
 
-at::Tensor flash_attention_decode_paged(
+at::Tensor flash_attention_decode_paged_sinks(
     const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
     std::optional<at::Tensor>& out_, const at::Tensor& block_table,
     const at::Tensor& seq_lens, at::Tensor& tmp_out, at::Tensor& max_logits,
@@ -4949,7 +4965,7 @@ at::Tensor flash_attention_decode_paged(
     const int launch_num_partitions, const std::string& kv_cache_dtype,
     const float k_scale, const float v_scale, const int window_size_left,
     const int window_size_right, const std::optional<at::Tensor>& anchor_lens,
-    const int64_t anchored_window) {
+    const int64_t anchored_window, const std::optional<at::Tensor>& sinks) {
   TORCH_CHECK(q.is_cuda(), "q must be on CUDA");
   TORCH_CHECK(k_cache.is_cuda() && v_cache.is_cuda(),
               "k/v cache must be on CUDA");
@@ -5062,6 +5078,21 @@ at::Tensor flash_attention_decode_paged(
     anchor_lens_ptr = anchors.data_ptr<int>();
   }
 
+  // Optional learned attention sinks, one fp32 natural-log value per query
+  // head. They are consumed by the cross-partition reducer only.
+  const float* sinks_ptr = nullptr;
+  if (sinks.has_value()) {
+    const at::Tensor& sink_values = sinks.value();
+    TORCH_CHECK(sink_values.is_cuda(), "sinks must be on CUDA");
+    TORCH_CHECK(sink_values.device() == q.device(),
+                "sinks must be on the q device");
+    TORCH_CHECK(sink_values.dtype() == torch::kFloat32, "sinks must be fp32");
+    TORCH_CHECK(sink_values.dim() == 1 && sink_values.size(0) == num_heads_q,
+                "sinks must have shape [H_q]");
+    TORCH_CHECK(sink_values.is_contiguous(), "sinks must be contiguous");
+    sinks_ptr = sink_values.data_ptr<float>();
+  }
+
   at::Tensor out = out_.has_value() ? out_.value() : torch::empty_like(q);
   TORCH_CHECK(out.is_cuda(), "out must be on CUDA");
   TORCH_CHECK(out.dtype() == torch::kFloat16, "out must be fp16");
@@ -5076,7 +5107,7 @@ at::Tensor flash_attention_decode_paged(
       q, k_cache, v_cache, out, block_table, seq_lens, tmp_out, max_logits,   \
       exp_sums, active_num_partitions, softmax_scale, launch_num_partitions,  \
       k_scale, v_scale, window_size_left, window_size_right, stream, 0, 0, 0, \
-      true, anchor_lens_ptr, static_cast<int>(anchored_window))
+      true, anchor_lens_ptr, static_cast<int>(anchored_window), sinks_ptr)
 
 #define LAUNCH_BY_KV_DTYPE(HDIM, PARTITION)                                   \
   do {                                                                        \
@@ -5092,7 +5123,8 @@ at::Tensor flash_attention_decode_paged(
               q, k_cache, v_cache, out, block_table, seq_lens, tmp_out,       \
               max_logits, exp_sums, active_num_partitions, softmax_scale,     \
               launch_num_partitions, k_scale, v_scale, window_size_left,      \
-              window_size_right, stream);                                     \
+              window_size_right, stream, 0, 0, 0, true, nullptr, 0,           \
+              sinks_ptr);                                                     \
         } else {                                                              \
           LAUNCH_TYPED(HDIM, PARTITION, flash_v100::KV_CACHE_DTYPE_FP8_E4M3); \
         }                                                                     \
@@ -5152,6 +5184,24 @@ at::Tensor flash_attention_decode_paged(
 
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
+}
+
+// The sink-free ABI keeps its original arity for existing direct callers.
+at::Tensor flash_attention_decode_paged(
+    const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
+    std::optional<at::Tensor>& out_, const at::Tensor& block_table,
+    const at::Tensor& seq_lens, at::Tensor& tmp_out, at::Tensor& max_logits,
+    at::Tensor& exp_sums, const at::Tensor& active_num_partitions,
+    const float softmax_scale, const int partition_size,
+    const int launch_num_partitions, const std::string& kv_cache_dtype,
+    const float k_scale, const float v_scale, const int window_size_left,
+    const int window_size_right, const std::optional<at::Tensor>& anchor_lens,
+    const int64_t anchored_window) {
+  return flash_attention_decode_paged_sinks(
+      q, k_cache, v_cache, out_, block_table, seq_lens, tmp_out, max_logits,
+      exp_sums, active_num_partitions, softmax_scale, partition_size,
+      launch_num_partitions, kv_cache_dtype, k_scale, v_scale, window_size_left,
+      window_size_right, anchor_lens, anchored_window, std::nullopt);
 }
 
 at::Tensor flash_attention_decode_paged_xqa(
@@ -5444,7 +5494,7 @@ at::Tensor flash_attention_decode_paged_xqa(
             MAX_PARTITIONS, q.size(1), tmp_out.stride(0), tmp_out.stride(1), \
             tmp_out.stride(2), max_logits.stride(0), max_logits.stride(1),   \
             out.stride(0), out.stride(1), PARTITION_BEGIN, ROUTE_BEGIN,      \
-            ROUTE_END, ROUTE_FINAL);                                         \
+            ROUTE_END, ROUTE_FINAL, nullptr);                                \
   } while (0)
         LAUNCH_E4M3_WAVE_REDUCER(0, kXQARouteShortSeqLens,
                                  short_launch_num_partitions, p256_begin,
@@ -5526,7 +5576,7 @@ at::Tensor flash_attention_decode_paged_xqa(
               reduce_num_partitions, q.size(1), tmp_out.stride(0),
               tmp_out.stride(1), tmp_out.stride(2), max_logits.stride(0),
               max_logits.stride(1), out.stride(0), out.stride(1), p256_begin, 0,
-              0, 0);
+              0, 0, nullptr);
 
       auto& traced_p64_p256_auto = flash_v100::policy::observation(3);
       if (xqa_e4m3_g6_p64_p256_auto_trace_enabled() && !traced_p64_p256_auto) {

@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from functools import partial
 from typing import Any
 
@@ -37,13 +37,20 @@ logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
 
 @dataclass(frozen=True)
 class DecodeConfig:
-    """Layer geometry and the frozen policy used by decode execution."""
+    """Layer geometry and the frozen policy used by decode execution.
+
+    ``sinks`` are the layer's learned attention sinks (fp32, one per local
+    query head, natural-log units). Every decode route of the layer applies
+    them: the generic paged decoder folds them into its softmax denominator,
+    and routes without sink support are not admitted or raise.
+    """
 
     policy: _config.V100AttnConfig
     scale: float
     kv_cache_dtype: str
     attn_type: str
     sliding_window: tuple[int, int] | None
+    sinks: torch.Tensor | None = field(default=None, compare=False)
 
     @property
     def kv_codec(self) -> KVCodec | None:
@@ -120,9 +127,39 @@ class DecodeExecutor:
         self.workspace = workspace
 
     def forward(self, request: DecodeRequest) -> torch.Tensor:
+        # Sinks reach every candidate through ``config.sinks``; this body and
+        # its single-argument call shape are pinned by the composition tests.
         return _plan.execute(
             request, (candidate(self) for candidate in DECODE_CANDIDATES)
         )
+
+    def _sinks(self, sinks: torch.Tensor | None) -> torch.Tensor | None:
+        """The layer's sinks: an explicit argument or the configured ones."""
+        configured = self.config.sinks
+        if sinks is None or sinks is configured:
+            return configured
+        if configured is not None:
+            raise ValueError(
+                "FLASH_ATTN_V100 decode received attention sinks that differ "
+                "from the sinks configured for this layer"
+            )
+        return sinks
+
+    def _with_sinks(self, sinks: torch.Tensor | None) -> DecodeExecutor:
+        """This executor, with explicit sinks bound into its configuration."""
+        sinks = self._sinks(sinks)
+        if sinks is self.config.sinks:
+            return self
+        return DecodeExecutor(
+            replace(self.config, sinks=sinks), self.ops, self.workspace
+        )
+
+    def _reject_sinks(self, sinks: torch.Tensor | None, route: str) -> None:
+        if self._sinks(sinks) is not None:
+            raise RuntimeError(
+                f"FLASH_ATTN_V100 {route} does not support attention sinks; "
+                "only the generic paged decode route applies them"
+            )
 
     def _flash_v100_window_size(self, causal: bool) -> tuple[int, int]:
         window = self.config.sliding_window
@@ -164,25 +201,33 @@ class DecodeExecutor:
         partition_size_hint: int | None = None,
         anchor_lens: torch.Tensor | None = None,
         anchored_window: int = 0,
+        sinks: torch.Tensor | None = None,
         record: _plan.RecordRoute = _plan.record_legacy,
     ) -> None:
+        sinks = self._sinks(sinks)
         scalar_tail = self.ops.scalar_tail
-        if scalar_tail is not None and scalar_tail(
-            query,
-            key_cache,
-            value_cache,
-            block_table,
-            seq_lens,
-            out=out,
-            softmax_scale=softmax_scale,
-            k_scale=k_scale,
-            v_scale=v_scale,
-            kv_cache_dtype=kv_cache_dtype,
-            window_size=window_size,
-            max_seq_len_hint=max_seq_len_hint,
-            partition_size_hint=partition_size_hint,
-            anchor_lens=anchor_lens,
-            anchored_window=anchored_window,
+        # The compact E4M3 scalar tail has no sink term; sinks take the
+        # generic paged decoder, whose cross-partition reducer applies them.
+        if (
+            sinks is None
+            and scalar_tail is not None
+            and scalar_tail(
+                query,
+                key_cache,
+                value_cache,
+                block_table,
+                seq_lens,
+                out=out,
+                softmax_scale=softmax_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                kv_cache_dtype=kv_cache_dtype,
+                window_size=window_size,
+                max_seq_len_hint=max_seq_len_hint,
+                partition_size_hint=partition_size_hint,
+                anchor_lens=anchor_lens,
+                anchored_window=anchored_window,
+            )
         ):
             record(_routing.ROUTE_SPECS["decode_e4m3_compact_scalar_tail"].name)
             return
@@ -218,6 +263,9 @@ class DecodeExecutor:
         for name, value in optional_kwargs.items():
             if name in self.ops.paged_keywords:
                 kwargs[name] = value
+        if sinks is not None:
+            # Never dropped: an operator without the keyword fails loudly.
+            kwargs["sinks"] = sinks
         self.ops.paged(
             query,
             key_cache,
@@ -343,6 +391,8 @@ class DecodeExecutor:
         kv_cache: torch.Tensor,
         attn_metadata: TritonAttentionMetadata,
         output: torch.Tensor,
+        *,
+        sinks: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Decode through the paged prefill WMMA kernel.
 
@@ -350,6 +400,7 @@ class DecodeExecutor:
         order as dense/paged prefill. It is a strictness bridge while the
         scalar paged decode kernel is brought to bitwise parity.
         """
+        self._reject_sinks(sinks, "decode-as-paged-prefill bridge")
         if not log_once_seen("flash_v100._logged_decode_paged_prefill"):
             logger.warning_once(
                 "FLASH_ATTN_V100 decode-as-paged-prefill path active. This is "
@@ -515,6 +566,8 @@ class DecodeExecutor:
         kv_cache: torch.Tensor,
         attn_metadata: TritonAttentionMetadata,
         output: torch.Tensor,
+        *,
+        sinks: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Decode through dense Flash-V100 with an incremental single-seq KV cache.
 
@@ -522,6 +575,7 @@ class DecodeExecutor:
         avoids full paged-KV gather after the first step, but it is still an
         oracle path rather than the final paged decode kernel.
         """
+        self._reject_sinks(sinks, "decode dense-cache bridge")
         if _routing.uses_fp8_kv_cache(self.config.kv_cache_dtype):
             if self.config.policy.use_flash_v100_prefill_paged:
                 return self._flash_v100_decode_as_paged_prefill(
@@ -612,6 +666,8 @@ class DecodeExecutor:
         kv_cache: torch.Tensor,
         attn_metadata: TritonAttentionMetadata,
         output: torch.Tensor,
+        *,
+        sinks: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Decode through dense Flash-V100 over gathered KV.
 
@@ -619,6 +675,7 @@ class DecodeExecutor:
         dense Flash-V100 oracle while the paged decode kernel is brought to
         bitwise parity.
         """
+        self._reject_sinks(sinks, "decode dense-reference bridge")
         if not log_once_seen("flash_v100._logged_decode_dense_reference"):
             logger.warning_once(
                 "FLASH_ATTN_V100 decode dense-reference path active. This is "
@@ -692,8 +749,15 @@ class DecodeExecutor:
         kv_cache: torch.Tensor,
         attn_metadata: TritonAttentionMetadata,
         output: torch.Tensor,
+        *,
+        sinks: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Decode path using Flash V100 directly over paged KV cache."""
+        executor = self._with_sinks(sinks)
+        if executor is not self:
+            return executor._flash_v100_decode(
+                layer, query, key, value, kv_cache, attn_metadata, output
+            )
         window_size = self._flash_v100_window_size(causal=True)
         if self.config.policy.prefix_anchored_decode_window is None:
             anchor_lens, anchored_window = None, 0
@@ -711,6 +775,7 @@ class DecodeExecutor:
 
         # FP8 G4 XQA had no end-to-end gain on 35B-A3B TP4 and has no accepted
         # sampled-quality advantage. Keep that shape on scalar decode.
+        # XQA has no sink term, so a sink layer always takes scalar decode.
         selection = _routing.select_route(
             _routing.RouteContext(
                 stage="decode",
@@ -722,7 +787,7 @@ class DecodeExecutor:
                     query.shape[2],
                     key_cache.shape[1],
                 ),
-                enabled=self.config.policy.use_decode_xqa,
+                enabled=self.config.policy.use_decode_xqa and self.config.sinks is None,
                 available=self.ops.xqa is not None,
                 query=query,
                 metadata=attn_metadata,
@@ -762,6 +827,7 @@ class DecodeExecutor:
         *,
         record: _plan.RecordRoute = _plan.record_legacy,
     ) -> torch.Tensor:
+        self._reject_sinks(None, "XQA decode")
         _routing.log_fp8_kv_cache_route(
             "decode", self.config.kv_cache_dtype, "xqa_paged", record=record
         )
@@ -842,8 +908,10 @@ class DecodeExecutor:
         anchor_lens: torch.Tensor | None,
         anchored_window: int,
         *,
+        sinks: torch.Tensor | None = None,
         record: _plan.RecordRoute = _plan.record_legacy,
     ) -> torch.Tensor:
+        sinks = self._sinks(sinks)
         _routing.log_fp8_kv_cache_route(
             "decode", self.config.kv_cache_dtype, "scalar_paged", record=record
         )
@@ -855,6 +923,9 @@ class DecodeExecutor:
             attn_metadata=attn_metadata,
             window_size=window_size,
         )
+        # Sinks are passed only when present, so sink-free calls keep the
+        # exact keyword set of existing (and injected) decode callables.
+        sink_kwargs = {} if sinks is None else {"sinks": sinks}
         (
             self.ops.scalar_override
             or partial(self._call_flash_attn_decode_paged, record=record)
@@ -887,6 +958,7 @@ class DecodeExecutor:
             ),
             anchor_lens=anchor_lens,
             anchored_window=anchored_window,
+            **sink_kwargs,
         )
         record(_routing.ROUTE_SPECS["decode_scalar_paged"].name)
         return output
@@ -947,6 +1019,10 @@ class DecodeCandidate(_plan.Candidate[DecodeRequest, torch.Tensor]):
     def __init__(self, executor: DecodeExecutor):
         self.executor = executor
 
+    def _sink_free(self) -> bool:
+        """Diagnostic bridges have no sink term; sink layers skip them."""
+        return self.executor.config.sinks is None
+
 
 class DecodeUnavailable(DecodeCandidate):
     def admit(self, request: DecodeRequest) -> bool:
@@ -994,6 +1070,7 @@ class DecodePagedPrefill(DecodeCandidate):
             self.executor.config.policy.use_decode_paged_prefill
             and self.executor.config.policy.use_flash_v100_prefill_paged
             and (not request.is_capturing)
+            and self._sink_free()
         )
 
     def run(self, request: DecodeRequest, record: _plan.RecordRoute) -> torch.Tensor:
@@ -1031,8 +1108,10 @@ class DecodePagedPrefill(DecodeCandidate):
 
 class DecodeDenseCache(DecodeCandidate):
     def admit(self, request: DecodeRequest) -> bool:
-        return self.executor.config.policy.use_decode_dense_cache and (
-            not request.is_capturing
+        return (
+            self.executor.config.policy.use_decode_dense_cache
+            and (not request.is_capturing)
+            and self._sink_free()
         )
 
     def run(self, request: DecodeRequest, record: _plan.RecordRoute) -> torch.Tensor:
@@ -1072,8 +1151,10 @@ class DecodeDenseCache(DecodeCandidate):
 
 class DecodeDenseReference(DecodeCandidate):
     def admit(self, request: DecodeRequest) -> bool:
-        return self.executor.config.policy.use_decode_dense_reference and (
-            not request.is_capturing
+        return (
+            self.executor.config.policy.use_decode_dense_reference
+            and (not request.is_capturing)
+            and self._sink_free()
         )
 
     def run(self, request: DecodeRequest, record: _plan.RecordRoute) -> torch.Tensor:
