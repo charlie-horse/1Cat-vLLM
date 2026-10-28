@@ -79,6 +79,7 @@ def arm_dflash_nvfp4_trace() -> None:
 _SUPPORTED_CONTRACTS: Final = {
     # (hidden size, global expert intermediate size, experts, top-k)
     (2048, 512, 256, 8),  # Qwen3.6-35B-A3B
+    (2048, 512, 256, 6),  # Flint
     (2560, 640, 512, 10),  # Qwen3.8-Flash-Next
     (4096, 2048, 288, 8),  # GLM-5.3-Flash
 }

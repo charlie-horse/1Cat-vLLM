@@ -178,7 +178,8 @@ def test_qwen38_w2_direct_reduce_defaults_on_and_can_be_disabled(monkeypatch):
     ("field", "value"),
     [
         ("num_experts", 128),
-        ("experts_per_token", 6),
+        # Top-k 6 is now a validated contract of this shape; probe 4 instead.
+        ("experts_per_token", 4),
         ("hidden_dim", 4096),
         ("intermediate_size_per_partition", 96),
         ("tp_size", 2),
