@@ -376,7 +376,8 @@ __global__ void __launch_bounds__(
         const int window_size_right, float* __restrict__ split_tmp_out,
         float* __restrict__ split_tmp_row_max,
         float* __restrict__ split_tmp_row_sum, const int split_kv_tiles,
-        const int* __restrict__ anchor_lens, const int anchored_window) {
+        const int* __restrict__ anchor_lens, const int anchored_window,
+        const float* __restrict__ sinks) {
   static_assert(!ANCHORED_SWA ||
                     (IS_CAUSAL && KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP16),
                 "ANCHORED_SWA requires causal attention and an fp16 KV cache");
@@ -1757,13 +1758,26 @@ __global__ void __launch_bounds__(
     return;
   }
 
+  // A learned attention sink (one fp32 logit per query head, natural-log
+  // units) adds exp(sink) to the softmax denominator and has no value row.
+  // sRowMax holds the running max of the already-scaled scores in the same
+  // units, so the sink enters as exp(sink - row_max). The upper clamp keeps
+  // a row without visible keys (row_max == NEG_INF) finite and zero. The
+  // pointer is uniform per launch; without it the arithmetic is unchanged.
+  // Split-KV partials return above and never carry a sink.
+  const bool has_sink = sinks != nullptr;
+  const float sink = has_sink ? __ldg(sinks + q_head_id) : 0.0f;
   const int total_fp16_x4 = (valid_q_rows * D) / 4;
 
   for (int i = tid; i < total_fp16_x4; i += THREADS_PER_BLOCK) {
     const int row = i / (D / 4);
     const int col = (i % (D / 4)) * 4;
 
-    const float sum_clamped = fmaxf(sRowSum[row], 1e-24f);
+    float row_sum = sRowSum[row];
+    if (has_sink) {
+      row_sum += __expf(fminf(sink - sRowMax[row], 80.0f));
+    }
+    const float sum_clamped = fmaxf(row_sum, 1e-24f);
     const float inv_sum = 1.0f / sum_clamped;
     const float* sO_row = sO + row * O_STRIDE;
 
@@ -1781,7 +1795,11 @@ __global__ void __launch_bounds__(
   }
 
   if (tid < valid_q_rows) {
-    const float sum = fmaxf(sRowSum[tid], 1e-24f);
+    float row_sum = sRowSum[tid];
+    if (has_sink) {
+      row_sum += __expf(fminf(sink - sRowMax[tid], 80.0f));
+    }
+    const float sum = fmaxf(row_sum, 1e-24f);
     softmax_lse_ptr[tid] = sRowMax[tid] + logf(sum);
   }
 }
@@ -1800,7 +1818,7 @@ void launcher_flash_attention_forward_paged_impl(
     int64_t bfla_mask_stride_k, float softmax_scale, bool is_causal,
     float k_scale, float v_scale, int window_size_left, int window_size_right,
     cudaStream_t stream, const int* anchor_lens = nullptr,
-    int anchored_window = 0) {
+    int anchored_window = 0, const float* sinks = nullptr) {
   using Config = KernelConfig<D, LOW_SMEM, LOW_SMEM_SCALAR_QK, LOW_SMEM_BM32,
                               D256_OUTPUT_STRIDE_268, D256_SW_PIPELINE_QK,
                               D256_SW_PIPELINE_PV>;
@@ -1848,7 +1866,7 @@ void launcher_flash_attention_forward_paged_impl(
           k_block_stride, k_token_stride, k_head_stride, v_block_stride,
           v_token_stride, v_head_stride, softmax_scale, k_scale, v_scale,
           window_size_left, window_size_right, nullptr, nullptr, nullptr, 0,
-          anchor_lens, anchored_window);
+          anchor_lens, anchored_window, sinks);
       return;
     }
   } else {
@@ -1882,7 +1900,7 @@ void launcher_flash_attention_forward_paged_impl(
         bfla_mask_stride_k, page_block_size, num_kv_heads, k_block_stride,
         k_token_stride, k_head_stride, v_block_stride, v_token_stride,
         v_head_stride, softmax_scale, k_scale, v_scale, window_size_left,
-        window_size_right, nullptr, nullptr, nullptr, 0, nullptr, 0);
+        window_size_right, nullptr, nullptr, nullptr, 0, nullptr, 0, sinks);
   } else {
     flash_attention_forward_kernel_paged<
         D, LOW_SMEM, LOW_SMEM_CONTIG_FAST, LOW_SMEM_SCALAR_QK, LOW_SMEM_BM32,
@@ -1896,7 +1914,7 @@ void launcher_flash_attention_forward_paged_impl(
         bfla_mask_stride_k, page_block_size, num_kv_heads, k_block_stride,
         k_token_stride, k_head_stride, v_block_stride, v_token_stride,
         v_head_stride, softmax_scale, k_scale, v_scale, window_size_left,
-        window_size_right, nullptr, nullptr, nullptr, 0, nullptr, 0);
+        window_size_right, nullptr, nullptr, nullptr, 0, nullptr, 0, sinks);
   }
 }
 
@@ -2059,7 +2077,8 @@ void launcher_flash_attention_forward_paged_splitkv_impl(
             softmax_scale, k_scale, v_scale, window_size_left,
             window_size_right, split_tmp_out.data_ptr<float>(),
             split_tmp_row_max.data_ptr<float>(),
-            split_tmp_row_sum.data_ptr<float>(), split_kv_tiles, nullptr, 0);
+            split_tmp_row_sum.data_ptr<float>(), split_kv_tiles, nullptr, 0,
+            nullptr);
   } else {
     flash_attention_forward_kernel_paged<D, LOW_SMEM, LOW_SMEM_CONTIG_FAST,
                                          LOW_SMEM_SCALAR_QK, false, true, false,
@@ -2074,7 +2093,8 @@ void launcher_flash_attention_forward_paged_splitkv_impl(
             softmax_scale, k_scale, v_scale, window_size_left,
             window_size_right, split_tmp_out.data_ptr<float>(),
             split_tmp_row_max.data_ptr<float>(),
-            split_tmp_row_sum.data_ptr<float>(), split_kv_tiles, nullptr, 0);
+            split_tmp_row_sum.data_ptr<float>(), split_kv_tiles, nullptr, 0,
+            nullptr);
   }
 
   const dim3 merge_grid(grid_x, 1, B * H);
@@ -3178,7 +3198,7 @@ void launcher_flash_attention_forward_paged(
     int bfla_mask_block_n = 0, int64_t bfla_mask_stride_b = 0,
     int64_t bfla_mask_stride_h = 0, int64_t bfla_mask_stride_q = 0,
     int64_t bfla_mask_stride_k = 0, const int* anchor_lens = nullptr,
-    int anchored_window = 0) {
+    int anchored_window = 0, const float* sinks = nullptr) {
   if (anchor_lens != nullptr && anchored_window > 0) {
     TORCH_CHECK(KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP16,
                 "anchored decode window requires an fp16 KV cache");
@@ -3195,7 +3215,23 @@ void launcher_flash_attention_forward_paged(
         bfla_mask_ptr, bfla_mask_block_n, bfla_mask_stride_b,
         bfla_mask_stride_h, bfla_mask_stride_q, bfla_mask_stride_k,
         softmax_scale, is_causal, k_scale, v_scale, window_size_left,
-        window_size_right, stream, anchor_lens, anchored_window);
+        window_size_right, stream, anchor_lens, anchored_window, sinks);
+    return;
+  }
+  if (sinks != nullptr) {
+    // Only the shared epilogue of the generic kernel adds the sink to the
+    // softmax denominator, so sinks keep every head size on that existing
+    // instantiation. The D256 low-SMEM and BM32 phase variants are skipped.
+    TORCH_CHECK(bfla_mask_ptr == nullptr,
+                "attention sinks cannot be combined with a block sparsity "
+                "mask");
+    launcher_flash_attention_forward_paged_impl<D, KV_DTYPE, false, false,
+                                                false, false>(
+        Q, K_cache, V_cache, Out, softmax_lse, block_table, seq_lens,
+        bfla_mask_ptr, bfla_mask_block_n, bfla_mask_stride_b,
+        bfla_mask_stride_h, bfla_mask_stride_q, bfla_mask_stride_k,
+        softmax_scale, is_causal, k_scale, v_scale, window_size_left,
+        window_size_right, stream, nullptr, 0, sinks);
     return;
   }
   if constexpr (D == 256 && KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP16) {
@@ -3536,14 +3572,14 @@ at::Tensor flash_attention_prefill_paged_splitkv(
   return out_fp16;
 }
 
-at::Tensor flash_attention_prefill_paged(
+static at::Tensor prefill_paged_forward(
     const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
     std::optional<at::Tensor>& out_, const at::Tensor& block_table,
     const at::Tensor& seq_lens, const float softmax_scale,
     const std::string& kv_cache_dtype, const float k_scale, const float v_scale,
     const bool is_causal, const int window_size_left,
     const int window_size_right, const std::optional<at::Tensor>& anchor_lens,
-    const int64_t anchored_window) {
+    const int64_t anchored_window, const std::optional<at::Tensor>& sinks) {
   TORCH_CHECK(q.dtype() == torch::kFloat16, "q must be fp16");
   const int kv_dtype_code = kv_cache_dtype_code_from_string(kv_cache_dtype);
   TORCH_CHECK(kv_dtype_code >= 0,
@@ -3608,6 +3644,18 @@ at::Tensor flash_attention_prefill_paged(
     anchor_lens_ptr = anchors.data_ptr<int>();
   }
 
+  const float* sinks_ptr = nullptr;
+  if (sinks.has_value()) {
+    const at::Tensor& sink_logits = sinks.value();
+    TORCH_CHECK(sink_logits.is_cuda() && sink_logits.device() == q.device(),
+                "sinks must be on the q device");
+    TORCH_CHECK(sink_logits.dtype() == torch::kFloat32, "sinks must be fp32");
+    TORCH_CHECK(sink_logits.dim() == 1 && sink_logits.size(0) == H,
+                "sinks must have shape [num_q_heads]");
+    TORCH_CHECK(sink_logits.is_contiguous(), "sinks must be contiguous");
+    sinks_ptr = sink_logits.data_ptr<float>();
+  }
+
   at::Tensor out_fp16 = out_.has_value() ? out_.value() : torch::zeros_like(q);
   auto softmax_lse =
       torch::zeros({B, H, M}, torch::dtype(torch::kFloat32).device(q.device()));
@@ -3622,7 +3670,7 @@ at::Tensor flash_attention_prefill_paged(
       q, k_cache, v_cache, out_fp16, softmax_lse, block_table, seq_lens,  \
       softmax_scale, is_causal, k_scale, v_scale, window_size_left,       \
       window_size_right, stream, nullptr, 0, 0, 0, 0, 0, anchor_lens_ptr, \
-      static_cast<int>(anchored_window))
+      static_cast<int>(anchored_window), sinks_ptr)
 
 #define LAUNCH_PAGED_BY_KV(HDIM)                                            \
   do {                                                                      \
@@ -3665,6 +3713,36 @@ at::Tensor flash_attention_prefill_paged(
 #undef LAUNCH_PAGED_TYPED
 
   return out_fp16;
+}
+
+at::Tensor flash_attention_prefill_paged(
+    const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
+    std::optional<at::Tensor>& out_, const at::Tensor& block_table,
+    const at::Tensor& seq_lens, const float softmax_scale,
+    const std::string& kv_cache_dtype, const float k_scale, const float v_scale,
+    const bool is_causal, const int window_size_left,
+    const int window_size_right, const std::optional<at::Tensor>& anchor_lens,
+    const int64_t anchored_window) {
+  return prefill_paged_forward(q, k_cache, v_cache, out_, block_table, seq_lens,
+                               softmax_scale, kv_cache_dtype, k_scale, v_scale,
+                               is_causal, window_size_left, window_size_right,
+                               anchor_lens, anchored_window, std::nullopt);
+}
+
+// Paged prefill with one learned fp32 sink logit per query head. The ABI of
+// prefill_paged_fwd is unchanged; callers probe for this entry instead.
+at::Tensor flash_attention_prefill_paged_sinks(
+    const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
+    std::optional<at::Tensor>& out_, const at::Tensor& block_table,
+    const at::Tensor& seq_lens, const float softmax_scale,
+    const std::string& kv_cache_dtype, const float k_scale, const float v_scale,
+    const bool is_causal, const int window_size_left,
+    const int window_size_right, const std::optional<at::Tensor>& anchor_lens,
+    const int64_t anchored_window, const at::Tensor& sinks) {
+  return prefill_paged_forward(q, k_cache, v_cache, out_, block_table, seq_lens,
+                               softmax_scale, kv_cache_dtype, k_scale, v_scale,
+                               is_causal, window_size_left, window_size_right,
+                               anchor_lens, anchored_window, sinks);
 }
 
 std::vector<at::Tensor>
@@ -4144,7 +4222,7 @@ at::Tensor flash_attention_dflash2_paged_bmhd(
       q.size(1), table.size(1) * k.size(1), nullptr, 0, 0, 0, 0, 0, k.size(1),
       k.size(2), k.stride(0), k.stride(1), k.stride(2), v.stride(0),
       v.stride(1), v.stride(2), scale, 1.f, 1.f, 2047, 2047, nullptr, nullptr,
-      nullptr, 0, nullptr, 0);
+      nullptr, 0, nullptr, 0, nullptr);
   AT_CUDA_CHECK(cudaGetLastError());
   return out;
 }

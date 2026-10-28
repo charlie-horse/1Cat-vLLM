@@ -67,6 +67,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Small noncausal DFlash2 paged attention in direct BMHD layout");
   m.def("prefill_paged_fwd", &flash_attention_prefill_paged,
         "FlashAttention prefill over paged KV cache (Volta)");
+  m.def("prefill_paged_sinks_fwd", &flash_attention_prefill_paged_sinks,
+        "FlashAttention prefill over paged KV cache with per-head attention "
+        "sinks (Volta)");
   m.def("prefill_paged_d256_bm32_allp_pair_scratch_fwd",
         &flash_attention_prefill_paged_d256_bm32_allp_pair_scratch,
         "Fixed causal D256 BM32 ALL_P pair-scratch paged prefill (SM70)");
@@ -134,6 +137,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         flash_v100::policy::with_policy(&flash_attention_dflash2_paged_bmhd));
   m.def("prefill_paged_fwd_configured",
         flash_v100::policy::with_policy(&flash_attention_prefill_paged));
+  m.def("prefill_paged_sinks_fwd_configured",
+        flash_v100::policy::with_policy(&flash_attention_prefill_paged_sinks));
   m.def("prefill_paged_d256_bm32_allp_pair_scratch_fwd_configured",
         flash_v100::policy::with_policy(
             &flash_attention_prefill_paged_d256_bm32_allp_pair_scratch));

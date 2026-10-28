@@ -1739,13 +1739,23 @@ def flash_attn_prefill_paged(
     anchored_window: int = 0,
     dflash2_window_split: bool = True,
     *,
+    sinks: torch.Tensor | None = None,
     _runtime=None,
 ):
+    """Paged prefill; ``sinks`` adds one learned logit per query head.
+
+    ``sinks`` is an fp32 ``[num_q_heads]`` tensor of natural-log logits on the
+    query device. Each one adds ``exp(sink)`` to its head's softmax
+    denominator without a value row; ``None`` keeps the sink-free kernels.
+    """
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
+    if sinks is not None:
+        sinks = _validate_prefill_sinks(q, sinks)
 
     if (
-        not causal
+        sinks is None
+        and not causal
         and window_size == (2047, 2047)
         and anchor_lens is None
         and anchored_window == 0
@@ -1840,9 +1850,8 @@ def flash_attn_prefill_paged(
     q_ = q.permute(0, 2, 1, 3).contiguous()
     out_ = out.permute(0, 2, 1, 3).contiguous() if out is not None else None
 
-    out_ = (
-        _runtime.native if _runtime is not None else flash_attn_v100_cuda
-    ).prefill_paged_fwd(
+    native = _runtime.native if _runtime is not None else flash_attn_v100_cuda
+    native_args = (
         q_,
         k_cache,
         v_cache,
@@ -1859,7 +1868,42 @@ def flash_attn_prefill_paged(
         anchor_lens,
         int(anchored_window),
     )
+    if sinks is None:
+        out_ = native.prefill_paged_fwd(*native_args)
+    else:
+        out_ = _prefill_paged_sinks_op(native)(*native_args, sinks)
     return _copy_bhmd_to_bmhd_out(out_, out_original)
+
+
+def _validate_prefill_sinks(q: torch.Tensor, sinks: torch.Tensor) -> torch.Tensor:
+    """Check the sink contract of ``flash_attn_prefill_paged``.
+
+    ``q`` is ``[B, M, H, D]``, so ``sinks`` must be fp32 ``[H]`` on its device.
+    """
+    if not isinstance(sinks, torch.Tensor):
+        raise TypeError(f"sinks must be a torch.Tensor, got {type(sinks).__name__}")
+    if sinks.dtype != torch.float32:
+        raise TypeError(f"sinks must be float32, got {sinks.dtype}")
+    if q.ndim != 4 or tuple(sinks.shape) != (q.shape[2],):
+        raise ValueError(
+            f"sinks must have shape [num_q_heads] for q of shape "
+            f"{tuple(q.shape)} ([B, M, H, D]), got {tuple(sinks.shape)}"
+        )
+    if sinks.device != q.device:
+        raise ValueError(
+            f"sinks must be on the query device {q.device}, got {sinks.device}"
+        )
+    return maybe_contiguous(sinks)
+
+
+def _prefill_paged_sinks_op(native):
+    op = getattr(native, "prefill_paged_sinks_fwd", None)
+    if op is None:
+        raise RuntimeError(
+            "This flash_attn_v100 extension build has no attention-sink paged "
+            "prefill entry; rebuild flash_attn_v100."
+        )
+    return op
 
 
 # Advertise the packaged direct-output ABI to the attention backend. Older

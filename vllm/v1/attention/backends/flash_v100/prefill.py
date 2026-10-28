@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
 import torch
@@ -45,8 +46,14 @@ def _flash_v100_prefill(
     value: torch.Tensor,
     attn_metadata: TritonAttentionMetadata,
     output: torch.Tensor,
+    *,
+    sinks: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Prefill path for no-prefix case (query_len == seq_len per sequence)."""
+    if sinks is not None:
+        return _flash_v100_dense_prefill_with_sinks(
+            self, query, key, value, attn_metadata, output, sinks
+        )
     causal = getattr(attn_metadata, "causal", True)
     window_size = self._flash_v100_window_size(causal)
     num_actual_tokens = attn_metadata.num_actual_tokens
@@ -68,6 +75,163 @@ def _flash_v100_prefill(
         window_size=window_size,
         query_start_loc_device=attn_metadata.query_start_loc,
     )
+
+
+def _sink_kwargs(sinks: torch.Tensor | None) -> dict[str, torch.Tensor]:
+    # Sink-free calls keep their exact signature, so instance-level
+    # compatibility overrides without a ``sinks`` parameter still apply.
+    return {} if sinks is None else {"sinks": sinks}
+
+
+def _dense_kv_pages(tensor: torch.Tensor, batch: int, length: int) -> torch.Tensor:
+    """View packed ``[batch * length, heads, dim]`` K/V as one page per row."""
+    pages = tensor.view(batch, length, *tensor.shape[1:])
+    # The paged kernel loads 16-byte vectors along each token and head row.
+    if (
+        pages.stride(-1) != 1
+        or pages.data_ptr() % 16 != 0
+        or any(stride % 8 != 0 for stride in pages.stride()[:3])
+    ):
+        pages = pages.contiguous()
+    return pages
+
+
+def _flash_v100_dense_prefill_with_sinks(
+    self: PrefillExecutor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_metadata: TritonAttentionMetadata,
+    output: torch.Tensor,
+    sinks: torch.Tensor,
+) -> torch.Tensor:
+    """No-prefix prefill with attention sinks.
+
+    Only the paged prefill kernel adds a sink to its softmax denominator. Each
+    run of equal-length sequences therefore reads its raw K/V as a paged
+    cache with one page per sequence, the page size being the sequence
+    length. The kernel addresses pages through their strides, so the packed
+    K/V views are not copied, and the dense route's masks are unchanged.
+    """
+    paged = self.flash_attn_prefill_paged
+    if paged is None:
+        raise RuntimeError(
+            "FLASH_ATTN_V100 attention sinks require the paged prefill kernel; "
+            "it is unavailable."
+        )
+    causal = getattr(attn_metadata, "causal", True)
+    window_size = self._flash_v100_window_size(causal)
+    query_start_loc_cpu = getattr(attn_metadata, "query_start_loc_cpu", None)
+    query_start_loc = (
+        query_start_loc_cpu
+        if query_start_loc_cpu is not None
+        else attn_metadata.query_start_loc
+    )
+    offsets = [int(offset) for offset in query_start_loc.tolist()]
+    num_seqs = len(offsets) - 1
+    run_start = 0
+    while run_start < num_seqs:
+        seq_len = offsets[run_start + 1] - offsets[run_start]
+        run_end = run_start + 1
+        while run_end < num_seqs and offsets[run_end + 1] - offsets[run_end] == seq_len:
+            run_end += 1
+        if seq_len > 0:
+            tok_start, tok_end = offsets[run_start], offsets[run_end]
+            batch = run_end - run_start
+            out_run = paged(
+                query[tok_start:tok_end].view(batch, seq_len, *query.shape[1:]),
+                _dense_kv_pages(key[tok_start:tok_end], batch, seq_len),
+                _dense_kv_pages(value[tok_start:tok_end], batch, seq_len),
+                torch.arange(batch, dtype=torch.int32, device=query.device)[:, None],
+                torch.full((batch,), seq_len, dtype=torch.int32, device=query.device),
+                softmax_scale=self.scale,
+                kv_cache_dtype=FP16.name,
+                causal=causal,
+                window_size=window_size,
+                sinks=sinks,
+            )
+            output[tok_start:tok_end].copy_(
+                out_run.reshape(tok_end - tok_start, *out_run.shape[2:])
+            )
+        run_start = run_end
+    return output
+
+
+def _flash_v100_prefill_with_prefix_sinks(
+    self: PrefillExecutor,
+    layer: torch.nn.Module,
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    attn_metadata: TritonAttentionMetadata,
+    output: torch.Tensor,
+    sinks: torch.Tensor,
+) -> torch.Tensor:
+    """Prefix/chunked prefill with attention sinks.
+
+    Only the generic paged prefill kernel adds a sink to its softmax
+    denominator. The other prefill routes (the D256 fast paths, small-query
+    and mixed-batch decode rows, the non-causal draft batch and the gathered
+    dense fallback) are sink-unaware, so every sequence takes that kernel.
+    """
+    if self.prefix_anchored_decode_window is not None:
+        raise RuntimeError(
+            "FLASH_ATTN_V100 attention sinks cannot be combined with the "
+            "prefix-anchored decode window."
+        )
+    if not self.use_flash_v100_prefill_paged or self.flash_attn_prefill_paged is None:
+        raise RuntimeError(
+            "FLASH_ATTN_V100 attention sinks require the paged prefill kernel; "
+            "it is disabled or unavailable."
+        )
+    causal = getattr(attn_metadata, "causal", True)
+    window_size = self._flash_v100_window_size(causal)
+    num_actual_tokens = attn_metadata.num_actual_tokens
+    query = query[:num_actual_tokens]
+    out_view = output[:num_actual_tokens]
+    query_start_loc, seq_lens = _prefix_host_metadata(attn_metadata, query)
+    tree_requires_branch = self.ops.tree_requires_branch
+    if (
+        causal
+        and tree_requires_branch is not None
+        and tree_requires_branch(attn_metadata, query_start_loc)
+    ):
+        raise RuntimeError(
+            "FLASH_ATTN_V100 attention sinks do not support tree attention."
+        )
+    key_cache, value_cache = _kv_layout.split_paged_kv_cache(kv_cache)
+    k_scale = float(layer._k_scale_float)
+    v_scale = float(layer._v_scale_float)
+    for i in range(len(query_start_loc) - 1):
+        start = int(query_start_loc[i].item())
+        end = int(query_start_loc[i + 1].item())
+        if end <= start:
+            continue
+        out_seq = self._run_prefill_paged_call(
+            route="prefill_prefix_paged",
+            q_len=end - start,
+            seq_len=int(seq_lens[i].item()),
+            heads_q=query.shape[1],
+            heads_kv=key_cache.shape[2],
+            head_dim=key_cache.shape[3],
+            block_size=key_cache.shape[1],
+            fn=partial(
+                self.flash_attn_prefill_paged,
+                query[start:end].unsqueeze(0),
+                key_cache,
+                value_cache,
+                attn_metadata.block_table[i : i + 1],
+                attn_metadata.seq_lens[i : i + 1],
+                softmax_scale=self.scale,
+                kv_cache_dtype=self.kv_cache_dtype,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                causal=causal,
+                window_size=window_size,
+                sinks=sinks,
+            ),
+        )
+        out_view[start:end].copy_(out_seq.squeeze(0))
+    return output
 
 
 _BRIDGE_SHORT_QUERY_MIN_KV = 8192
@@ -759,8 +923,14 @@ def _flash_v100_prefill_with_prefix(
     kv_cache: torch.Tensor,
     attn_metadata: TritonAttentionMetadata,
     output: torch.Tensor,
+    *,
+    sinks: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Prefill path for prefix/chunked context via gathered contiguous KV."""
+    if sinks is not None:
+        return _flash_v100_prefill_with_prefix_sinks(
+            self, layer, query, kv_cache, attn_metadata, output, sinks
+        )
     causal = getattr(attn_metadata, "causal", True)
     window_size = self._flash_v100_window_size(causal)
     if self.prefix_anchored_decode_window is None:
@@ -1270,7 +1440,10 @@ def forward(
     output_block_scale: torch.Tensor | None,
     is_capturing: bool,
     layer_name: object,
+    *,
+    sinks: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    sink_kwargs = _sink_kwargs(sinks)
     available_query_tokens = min(
         int(query.shape[0]),
         int(key.shape[0]),
@@ -1326,6 +1499,7 @@ def forward(
                 kv_cache,
                 attn_metadata,
                 output,
+                **sink_kwargs,
             )
         smallq_decode = self.ops.small_query_enabled(attn_metadata)
         if smallq_decode:
@@ -1341,6 +1515,7 @@ def forward(
                 kv_cache,
                 attn_metadata,
                 output,
+                **sink_kwargs,
             )
         _debug.sm70_profile_trace(
             "forward branch=prefill_capture_full_flash layer=%s",
@@ -1366,6 +1541,7 @@ def forward(
             smallq_decode,
             metadata_live_token_mismatch,
             available_query_tokens,
+            **sink_kwargs,
         )
     if not log_once_seen("flash_v100._logged_prefill_flash"):
         logger.info_once(
@@ -1400,6 +1576,7 @@ def forward(
             kv_cache,
             attn_metadata,
             output,
+            **sink_kwargs,
         )
         self.ops.compare_triton(
             layer,
@@ -1421,7 +1598,9 @@ def forward(
         "forward branch=prefill_no_prefix_dense layer=%s",
         layer_name,
     )
-    result = self._flash_v100_prefill(query, key, value, attn_metadata, output)
+    result = self._flash_v100_prefill(
+        query, key, value, attn_metadata, output, **sink_kwargs
+    )
     self.ops.compare_triton(
         layer,
         query,
@@ -1590,6 +1769,8 @@ def _forward_with_prefix(
     smallq_decode,
     metadata_live_token_mismatch,
     available_query_tokens,
+    *,
+    sinks: torch.Tensor | None = None,
 ):
     if _debug.draft_graph_debug_enabled():
         _debug.draft_graph_debug_log(
@@ -1656,6 +1837,7 @@ def _forward_with_prefix(
         kv_cache,
         attn_metadata,
         output,
+        **_sink_kwargs(sinks),
     )
     self.ops.compare_triton(
         layer,

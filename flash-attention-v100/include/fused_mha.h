@@ -118,6 +118,15 @@ at::Tensor flash_attention_prefill_paged(
     const int window_size_right, const std::optional<at::Tensor>& anchor_lens,
     const int64_t anchored_window);
 
+at::Tensor flash_attention_prefill_paged_sinks(
+    const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
+    std::optional<at::Tensor>& out_, const at::Tensor& block_table,
+    const at::Tensor& seq_lens, const float softmax_scale,
+    const std::string& kv_cache_dtype, const float k_scale, const float v_scale,
+    const bool is_causal, const int window_size_left,
+    const int window_size_right, const std::optional<at::Tensor>& anchor_lens,
+    const int64_t anchored_window, const at::Tensor& sinks);
+
 std::vector<at::Tensor>
 flash_attention_prefill_paged_d256_bm32_allp_pair_scratch(
     const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
