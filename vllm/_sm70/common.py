@@ -108,6 +108,16 @@ def has_nvfp4_grouped_batch_reduce_dispatch() -> bool:
     return hasattr(torch.ops._C, "nvfp4_grouped_w2_batch_reduce_sm70_out")
 
 
+def has_nvfp4_moe_decode_dispatch() -> bool:
+    return all(
+        hasattr(torch.ops._C, name)
+        for name in (
+            "nvfp4_moe_decode_w13_swiglu_sm70_out",
+            "nvfp4_moe_decode_w2_reduce_sm70_out",
+        )
+    )
+
+
 def has_nvfp4_qpn_w2_reduce_dispatch() -> bool:
     return hasattr(
         torch.ops._C_qwen38,

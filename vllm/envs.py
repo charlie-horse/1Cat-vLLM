@@ -351,6 +351,7 @@ if TYPE_CHECKING:
     VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES: bool = True
     VLLM_SM70_NVFP4_QWEN38_TP4_M1_FAST_SELECTOR: bool = True
     VLLM_SM70_NVFP4_QWEN38_MOE_QPN_M1_DECODE: bool = True
+    VLLM_SM70_FLINT_MOE_QPN_DECODE: bool = True
     VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_DECODE: bool = True
     VLLM_SM70_NVFP4_QWEN38_MOE_QPN_DYNAMIC_DECODE: bool = False
     VLLM_SM70_NVFP4_MOE_GROUPED_DECODE: bool = False
@@ -5057,6 +5058,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "skipping the replicated-input prepare kernel. The fixed TP4 "
             "8192x512 acceptance run reached 82.274 tokens/s with unchanged "
             "arithmetic and Chinese hashes."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind NVFP4",),
+        user_visible=False,
+    ),
+    # Two-kernel routed-expert decode for Flint NVFP4 at TP2 and M<=2 tokens
+    # (W13+SwiGLU, then W2+top-k reduce, routed on device from the TurboMind
+    # banks). "0" keeps the TurboMind single-token and compact routes.
+    "VLLM_SM70_FLINT_MOE_QPN_DECODE": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_FLINT_MOE_QPN_DECODE", "1"))),
+        description=(
+            "Two-kernel routed-expert decode for Flint NVFP4 at TP2 and one or "
+            "two tokens: W13 with fused SwiGLU, then W2 with the fused top-k "
+            "weighted reduction, both reading the TurboMind-packed expert "
+            "banks and routing on device. FP32 accumulation, FP16 boundaries "
+            "and deterministic reductions. Set to 0 to keep the TurboMind "
+            "routes."
         ),
         category="configuration",
         declared_default="True",

@@ -177,9 +177,17 @@ def _loaded_layer(contract=FLINT, tp_size: int = 2, **attrs) -> NS:
         sm70_glm53_qpn_w13_q8=False,
         sm70_nvfp4_grouped_decode=False,
         sm70_nvfp4_grouped_mtp5=False,
+        # Load admits the two-kernel M<=2 decode on Flint's TP2 shapes only.
+        sm70_nvfp4_decode_qpn=_admits_decode_qpn(contract, tp_size),
     )
     values.update(attrs)
     return NS(**values)
+
+
+def _admits_decode_qpn(contract, tp_size: int) -> bool:
+    hidden, global_intermediate, experts, top_k = contract
+    local = (experts, hidden, global_intermediate // tp_size, top_k)
+    return local in moe._DECODE_QPN_CONTRACTS
 
 
 def _route_inputs(tokens: int, contract=FLINT):
@@ -500,8 +508,9 @@ def test_flint_workspace_sizes_follow_top_k(monkeypatch, tp_size):
 
 
 def _engaged_specialized_routes(layer, tokens: int, contract) -> list[str]:
-    x, ids, _ = _route_inputs(tokens, contract)
+    x, ids, weights = _route_inputs(tokens, contract)
     checks = {
+        "decode_qpn": moe._use_decode_qpn(layer, x, weights, ids),
         "qpn_m1": moe._use_qwen38_qpn_m1_decode(layer, x, ids),
         "qpn_batch": moe._use_qwen38_qpn_batch_decode(layer, x, ids),
         "qpn_batch_w13": moe._use_qwen38_qpn_batch_fused_w13(layer, x, ids),
@@ -529,7 +538,9 @@ def test_flint_never_engages_model_specific_routes(tp_size, tokens):
         sm70_nvfp4_grouped_decode=True,
         sm70_nvfp4_grouped_mtp5=True,
     )
-    assert _engaged_specialized_routes(layer, tokens, FLINT) == []
+    # Only Flint's own M<=2 decode, and only where load admitted it (TP2).
+    expected = ["decode_qpn"] if tp_size == 2 and tokens <= 2 else []
+    assert _engaged_specialized_routes(layer, tokens, FLINT) == expected
 
 
 def test_specialized_route_probe_detects_its_own_contract():
@@ -537,6 +548,127 @@ def test_specialized_route_probe_detects_its_own_contract():
     assert "qpn_m1" in _engaged_specialized_routes(layer, 1, QWEN38)
     assert "qpn_mtp5" in _engaged_specialized_routes(layer, 5, QWEN38)
     assert "indexed_prefill" in _engaged_specialized_routes(layer, 128, QWEN38)
+    assert "decode_qpn" not in _engaged_specialized_routes(layer, 1, QWEN38)
+
+
+@pytest.mark.parametrize(
+    ("contract", "tp_size", "admitted"),
+    [
+        (FLINT, 2, True),
+        (FLINT, 1, False),
+        (FLINT, 4, False),
+        (QWEN36, 2, False),
+        (QWEN38, 4, False),
+        (GLM53, 8, False),
+    ],
+)
+def test_decode_qpn_contract_is_flint_tp2_only(contract, tp_size, admitted):
+    assert _admits_decode_qpn(contract, tp_size) is admitted
+
+
+@pytest.mark.parametrize(
+    ("peak", "shift"),
+    [
+        (1.0, 0),
+        (1.1826171875, 0),  # largest prepared W2 scale in the real checkpoint
+        (3.998046875, 0),  # 3.998 * 2^14 = 65504, the FP16 max
+        (4.0, 1),
+        (14.0, 2),
+        (448.0 * 16, 11),
+        (65504.0, 14),
+    ],
+)
+def test_decode_qpn_scale_shift_keeps_fp16_headroom(peak, shift):
+    scales = torch.full((2, 3), peak / 4, dtype=torch.float16)
+    scales[1, 2] = peak
+    assert moe._decode_qpn_scale_shift(scales) == shift
+    assert peak * 2.0 ** (14 - shift) <= 65504.0
+
+
+@pytest.mark.parametrize("bad", (float("inf"), float("nan")))
+def test_decode_qpn_scale_shift_rejects_non_finite_scales(bad):
+    scales = torch.ones(4, dtype=torch.float16)
+    scales[2] = bad
+    assert moe._decode_qpn_scale_shift(scales) is None
+
+
+def _decode_load_layer(scale_peak: float = 1.0) -> NS:
+    w13_scales = torch.full((4, 8), 0.01, dtype=torch.float16)
+    w2_scales = torch.full((4, 8), 0.01, dtype=torch.float16)
+    w2_scales[3, 1] = scale_peak
+    return NS(
+        sm70_moe_policy=NS(flint_qpn_decode=True, explicit_fields=()),
+        w13_tm_weight=torch.empty(0),
+        w13_tm_scales=w13_scales,
+        w2_tm_scales=w2_scales,
+    )
+
+
+FLINT_TP2_LOCAL = (256, 2048, 256, 6)
+
+
+def _prepare_decode(layer, contract=FLINT_TP2_LOCAL, *, available=True, **kwargs):
+    native = NS(has_nvfp4_moe_decode_dispatch=lambda: available)
+    moe._prepare_decode_qpn(layer, native, contract, **kwargs)
+
+
+def test_decode_qpn_load_admits_flint_tp2_with_workspace():
+    layer = _decode_load_layer()
+    _prepare_decode(layer, supported=True)
+    assert layer.sm70_nvfp4_decode_qpn
+    assert layer.sm70_nvfp4_decode_w13_scale_shift == 0
+    assert layer.sm70_nvfp4_decode_w2_scale_shift == 0
+    assert layer._nvfp4_decode_partials.shape == (moe._DECODE_QPN_PARTIALS,)
+    assert layer._nvfp4_decode_partials.dtype == torch.float32
+    assert layer._nvfp4_decode_counters.shape == (moe._DECODE_QPN_COUNTERS,)
+    assert not layer._nvfp4_decode_counters.any()
+
+
+def test_decode_qpn_load_pre_shifts_large_scales():
+    layer = _decode_load_layer(scale_peak=14.0)
+    _prepare_decode(layer, supported=True)
+    assert layer.sm70_nvfp4_decode_qpn
+    assert layer.sm70_nvfp4_decode_w13_scale_shift == 0
+    assert layer.sm70_nvfp4_decode_w2_scale_shift == 2
+
+
+@pytest.mark.parametrize(
+    ("contract", "supported", "enabled", "available", "peak"),
+    [
+        ((256, 2048, 512, 6), True, True, True, 1.0),  # Flint TP1
+        ((256, 2048, 256, 8), True, True, True, 1.0),  # Qwen3.6 TP2
+        (FLINT_TP2_LOCAL, False, True, True, 1.0),  # raw scale / clamp / ...
+        (FLINT_TP2_LOCAL, True, False, True, 1.0),  # kill switch
+        (FLINT_TP2_LOCAL, True, True, False, 1.0),  # ops absent (default)
+        (FLINT_TP2_LOCAL, True, True, True, float("inf")),  # no FP16 range
+    ],
+)
+def test_decode_qpn_load_falls_back(contract, supported, enabled, available, peak):
+    layer = _decode_load_layer(scale_peak=peak)
+    layer.sm70_moe_policy.flint_qpn_decode = enabled
+    _prepare_decode(layer, contract, available=available, supported=supported)
+    assert not layer.sm70_nvfp4_decode_qpn
+    assert not hasattr(layer, "_nvfp4_decode_partials")
+
+
+def test_decode_qpn_explicit_request_fails_closed_without_ops():
+    layer = _decode_load_layer()
+    layer.sm70_moe_policy.explicit_fields = ("flint_qpn_decode",)
+    with pytest.raises(RuntimeError, match="VLLM_SM70_FLINT_MOE_QPN_DECODE"):
+        _prepare_decode(layer, available=False, supported=True)
+
+
+def test_decode_qpn_kill_switch_env(monkeypatch):
+    from vllm.config.sm70_moe import Sm70NvFp4MoEConfig
+
+    monkeypatch.delenv("VLLM_SM70_FLINT_MOE_QPN_DECODE", raising=False)
+    default = Sm70NvFp4MoEConfig()
+    default.resolve()
+    assert default.flint_qpn_decode is True
+    monkeypatch.setenv("VLLM_SM70_FLINT_MOE_QPN_DECODE", "0")
+    disabled = Sm70NvFp4MoEConfig()
+    disabled.resolve()
+    assert disabled.flint_qpn_decode is False
 
 
 @pytest.mark.parametrize("tp_size", (1, 2))
@@ -564,9 +696,23 @@ def test_flint_apply_takes_generic_turbomind_routes(monkeypatch, tp_size, tokens
 
     output = method.apply(layer, x, weights, ids, None, None)
 
-    assert output.shape == (tokens, hidden)
     execute.assert_called_once()
     plan = execute.call_args.args[1]
+    native = method.native_ops
+    if tp_size == 2 and tokens <= 2:
+        # Two native launches route on device: no permute, no slot prepare.
+        # The fused W2 stage writes the layer's persistent output buffer.
+        assert output is execute.return_value
+        assert execute.call_args.args[2]["output"].shape == (tokens, hidden)
+        assert (plan.w13, plan.w2) == (Stage.DECODE_QPN, Stage.DECODE_REDUCE)
+        assert execute.call_args.args[4] is ids
+        assert execute.call_args.args[5] is weights
+        assert execute.call_args.kwargs == {}
+        single.assert_not_called()
+        slot_groups.assert_not_called()
+        native.moe_permute_with_scratch.assert_not_called()
+        return
+    assert output.shape == (tokens, hidden)
     assert (plan.w13, plan.w2) == (Stage.DENSE, Stage.DENSE)
     assert not plan.interleaved and not plan.qpn_mtp
     assert plan.w13_split_k == 1
@@ -862,3 +1008,161 @@ def test_flint_turbomind_moe_matches_dequantized_reference(tp_size):
             assert torch.isfinite(actual).all(), tokens
             error = (actual.float() - expected).norm() / expected.norm()
             assert error < 1e-2, (tokens, error.item())
+
+
+# ---------------------------------------------------------------------------
+# GPU: two-kernel M<=2 decode (W13+SwiGLU, W2+reduce) on Flint TP2 shapes
+# ---------------------------------------------------------------------------
+
+
+def _prepared_flint_layer(raw, tp_size: int = 2):
+    config = _moe_config(FLINT, tp_size, device="cuda")
+    method = moe.ModelOptNvFp4SM70MoEMethod(_w4a16_config(), config)
+    layer = NS(
+        moe_config=config,
+        local_num_experts=256,
+        global_num_experts=256,
+        activation=MoEActivation.SILU,
+        apply_router_weight_on_input=False,
+        expert_map=None,
+        swiglu_limit=None,
+        w13_input_scale=None,
+        w2_input_scale=None,
+        **{name: t.clone() for name, t in raw.items()},
+    )
+    method.process_weights_after_loading(layer)
+    return method, layer
+
+
+def _flint_routing(tokens: int, generator: torch.Generator):
+    x = torch.randn(tokens, 2048, generator=generator).half().cuda()
+    logits = torch.randn(tokens, 256, generator=generator).cuda()
+    scores, ids = torch.sigmoid(logits).topk(6, dim=-1)
+    weights = (scores / scores.sum(dim=-1, keepdim=True)).contiguous()
+    return x, weights, ids.to(torch.int32).contiguous()
+
+
+def _turbomind_apply(method, layer, x, weights, ids) -> torch.Tensor:
+    layer.sm70_nvfp4_decode_qpn = False
+    try:
+        return method.apply(layer, x, weights, ids, None, None).clone()
+    finally:
+        layer.sm70_nvfp4_decode_qpn = True
+
+
+def _relative_error(actual, expected) -> float:
+    return ((actual.float() - expected.float()).norm() / expected.float().norm()).item()
+
+
+def _requires_decode_ops():
+    if not hasattr(torch.ops._C, "nvfp4_moe_decode_w13_swiglu_sm70_out"):
+        pytest.skip("requires the SM70 NVFP4 M<=2 decode extension")
+
+
+@requires_sm70
+@pytest.mark.parametrize("w2_global", (0.04, 7.0), ids=("checkpoint", "x16_w2"))
+def test_flint_decode_qpn_matches_reference_and_turbomind(monkeypatch, w2_global):
+    """M=1/2 against the FP32 dequantized oracle and the TurboMind route.
+
+    The second case makes the prepared W2 scales reach 28 (E4M3 up to 2 times
+    a global of 7), beyond the FP16 limit of prepared_scale * 2^14, so the
+    load-time power-of-two pre-shift must engage.
+    """
+    _requires_decode_ops()
+    monkeypatch.delenv("VLLM_SM70_FLINT_MOE_QPN_DECODE", raising=False)
+    generator = torch.Generator().manual_seed(20261029)
+    raw = _flint_expert_weights(256, generator)
+    raw["w2_weight_scale_2"].fill_(w2_global)
+    with set_current_vllm_config(_vllm_config("cuda")):
+        method, layer = _prepared_flint_layer(raw)
+        assert layer.sm70_nvfp4_decode_qpn
+        assert layer.sm70_nvfp4_decode_w13_scale_shift == 0
+        peak = layer.w2_tm_scales.float().max().item()
+        shift = layer.sm70_nvfp4_decode_w2_scale_shift
+        assert peak * 2.0 ** (14 - shift) <= 65504.0
+        assert (shift > 0) == (peak * 2.0**14 > 65504.0)
+        if w2_global > 1:
+            assert shift > 0
+        for tokens in (1, 2, 1, 2):
+            x, weights, ids = _flint_routing(tokens, generator)
+            if tokens == 2 and torch.rand(1, generator=generator) < 0.5:
+                ids[1] = ids[0]  # both tokens on the same six experts
+            actual = method.apply(layer, x, weights, ids, None, None).clone()
+            again = method.apply(layer, x, weights, ids, None, None).clone()
+            turbomind = _turbomind_apply(method, layer, x, weights, ids)
+            expected = _reference_moe(x, weights, ids, raw, 256)
+            torch.accelerator.synchronize()
+            assert torch.isfinite(actual).all(), tokens
+            assert torch.equal(actual, again), "decode must be deterministic"
+            assert _relative_error(actual, expected) < 1e-2, tokens
+            # TurboMind rounds the same FP16 boundaries in another K order.
+            assert _relative_error(actual, turbomind) < 2e-3, tokens
+
+
+@requires_sm70
+def test_flint_decode_qpn_skips_invalid_routes():
+    _requires_decode_ops()
+    generator = torch.Generator().manual_seed(7)
+    raw = _flint_expert_weights(256, generator)
+    with set_current_vllm_config(_vllm_config("cuda")):
+        method, layer = _prepared_flint_layer(raw)
+        assert layer.sm70_nvfp4_decode_qpn
+        x, weights, ids = _flint_routing(2, generator)
+        ids[0, 3] = -1
+        ids[1, 5] = 256
+        actual = method.apply(layer, x, weights, ids, None, None).clone()
+        valid = (ids >= 0) & (ids < 256)
+        expected = _reference_moe(
+            x, weights * valid, torch.where(valid, ids, 0), raw, 256
+        )
+        assert _relative_error(actual, expected) < 1e-2
+
+
+@requires_sm70
+def test_flint_decode_qpn_cuda_graph_replay():
+    """FULL-graph style capture at M=1 and M=2: replays track new inputs.
+
+    Replaying many times also checks that the split-K arrival counters re-arm
+    inside the kernel, with no reset launch and no host work.
+    """
+    _requires_decode_ops()
+    generator = torch.Generator().manual_seed(11)
+    raw = _flint_expert_weights(256, generator)
+    with set_current_vllm_config(_vllm_config("cuda")):
+        method, layer = _prepared_flint_layer(raw)
+        for tokens in (1, 2):
+            static = [t.clone() for t in _flint_routing(tokens, generator)]
+            method.apply(layer, *static, None, None)  # warm up outside capture
+            torch.accelerator.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                captured = method.apply(layer, *static, None, None)
+            for _ in range(4):
+                case = _flint_routing(tokens, generator)
+                for buffer, value in zip(static, case):
+                    buffer.copy_(value)
+                for _ in range(3):
+                    graph.replay()
+                replayed = captured.clone()
+                eager = method.apply(layer, *case, None, None).clone()
+                expected = _reference_moe(case[0], case[1], case[2], raw, 256)
+                torch.accelerator.synchronize()
+                assert torch.equal(replayed, eager), tokens
+                assert _relative_error(replayed, expected) < 1e-2, tokens
+            assert not layer._nvfp4_decode_counters.any()
+
+
+@requires_sm70
+def test_flint_decode_qpn_kill_switch_keeps_turbomind(monkeypatch):
+    _requires_decode_ops()
+    monkeypatch.setenv("VLLM_SM70_FLINT_MOE_QPN_DECODE", "0")
+    generator = torch.Generator().manual_seed(3)
+    raw = _flint_expert_weights(256, generator)
+    with set_current_vllm_config(_vllm_config("cuda")):
+        method, layer = _prepared_flint_layer(raw)
+        assert not layer.sm70_nvfp4_decode_qpn
+        assert not hasattr(layer, "_nvfp4_decode_partials")
+        x, weights, ids = _flint_routing(1, generator)
+        actual = method.apply(layer, x, weights, ids, None, None)
+        expected = _reference_moe(x, weights, ids, raw, 256)
+        assert _relative_error(actual, expected) < 1e-2

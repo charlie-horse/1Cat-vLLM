@@ -222,6 +222,18 @@ FP4_STAGE_BINDINGS = {
         "Qwen batch raw scales",
         "fused weighted reduction; original rounding",
     ),
+    ("nvfp4", "w13", "decode_qpn"): (
+        "nvfp4_moe_decode_w13_swiglu_sm70_out",
+        "w13+activation",
+        "M1/M2 route slots",
+        "FP32 split-K joined in order; FP16 gate/up and SwiGLU",
+    ),
+    ("nvfp4", "w2", "decode_reduce"): (
+        "nvfp4_moe_decode_w2_reduce_sm70_out",
+        "w2+reduce",
+        "M1/M2 route slots",
+        "FP16 routed outputs; slot-ordered FP32 weighted sum",
+    ),
     ("mxfp4", "w13", "prepare_w13"): (
         "mxfp4_moe_single_token_prepare_w13_sm70_out",
         "route+w13",
