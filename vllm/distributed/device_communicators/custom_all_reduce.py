@@ -649,12 +649,12 @@ class CustomAllreduce:
         Bitwise equal to this communicator's all-reduce followed by
         ``fused_add_rms_norm``. Callers check
         :meth:`can_tp2_all_reduce_fused_add_rms_norm` first.
+
+        The kernel stages this rank's input in the communicator's registered
+        buffer and reads the peer's copy there, so the operands need no IPC
+        registration: the same call works eagerly, in graph warmup and
+        under CUDA graph capture, wherever the operands were allocated.
         """
-        registered = self._IS_CAPTURING and torch.cuda.is_current_stream_capturing()
-        if inp_b is not None and not registered:
-            # Only captured buffers are IPC-registered pairwise; elsewhere
-            # add first (the same FP16 rounding) and stage the sum.
-            inp, inp_b = inp + inp_b, None
         normalized_out = torch.empty_like(inp)
         residual_out = torch.empty_like(residual)
         self._native.tp2_all_reduce_fused_add_rms_norm(
@@ -665,8 +665,8 @@ class CustomAllreduce:
             weight,
             normalized_out,
             residual_out,
-            0 if registered else self.buffer_ptrs[self.rank],
-            0 if registered else self.max_size,
+            self.buffer_ptrs[self.rank],
+            self.max_size,
             epsilon,
             scale,
         )

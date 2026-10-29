@@ -5,8 +5,14 @@
 Two V100s. The reference is what the model runs without the fusion: the
 custom all-reduce (cross_device_reduce_1stage), the elementwise scale or
 partial-sum add where present, then the vLLM C fused_add_rms_norm kernel.
-Every output must be bitwise equal to it, on both ranks, eagerly and in CUDA
-graph replays with skewed ranks.
+Every output must be bitwise equal to it, on both ranks.
+
+Run under the server's conditions as well: the allocator with
+expandable_segments (the serve script's PYTORCH_ALLOC_CONF), operands
+allocated before graph capture (static buffers the peer cannot open over
+IPC), graphs captured inside and outside the communicator's capture context
+(FULL and PIECEWISE capture, and capture-time warmup that runs eagerly), and
+ranks entering the collective at different times.
 """
 
 from datetime import timedelta
@@ -18,10 +24,13 @@ import torch.multiprocessing as mp
 
 H = 2048
 EPS = 1e-6
+ROWS = (1, 2, 3, 4, 5, 8, 16)
 
 
 def _reference(ca, x, x_b, residual, weight, scale):
-    reduced = ca.custom_all_reduce(x if x_b is None else x + x_b)
+    """Unfused ops; under capture the collective input is a pool buffer."""
+    total = x.clone() if x_b is None else x + x_b
+    reduced = ca.custom_all_reduce(total)
     if scale != 1.0:
         reduced = reduced * scale
     out = reduced.clone()
@@ -52,11 +61,19 @@ def _assert_same_on_both_ranks(*tensors):
         assert torch.equal(gathered[0], gathered[1])
 
 
-def _check(rank: int, rendezvous: str) -> None:
+def _assert_equal(actual, expected, context):
+    for a, e in zip(actual, expected):
+        assert torch.equal(a, e), context
+
+
+def _check(rank: int, rendezvous: str, expandable: bool) -> None:
     from vllm.distributed.device_communicators.custom_all_reduce import (
         CustomAllreduce,
     )
 
+    if expandable:
+        # Before the first allocation, as PYTORCH_ALLOC_CONF would.
+        torch.cuda.memory._set_allocator_settings("expandable_segments:True")
     torch.accelerator.set_device_index(rank)
     torch.set_num_threads(1)
     dist.init_process_group(
@@ -70,6 +87,7 @@ def _check(rank: int, rendezvous: str) -> None:
         dist.group.WORLD, torch.device("cuda", rank), max_size=8 * 1024 * 1024
     )
     assert not ca.disabled
+    fused = ca.tp2_all_reduce_fused_add_rms_norm
     try:
         weight = torch.empty(H, device="cuda", dtype=torch.float16)
 
@@ -83,8 +101,8 @@ def _check(rank: int, rendezvous: str) -> None:
         assert not admitted(17) and not admitted(2, hidden=4096)
         assert not admitted(2, dtype=torch.bfloat16)
 
-        # Eager: inputs are staged into the registered buffer.
-        for rows in (1, 2, 3, 8, 16):
+        # Eager, and eagerly inside the capture context (graph warmup).
+        for rows in ROWS:
             for sum2 in (False, True):
                 for scale in (1.0, 0.125):
                     for seed, magnitude in enumerate((1.0, 64.0, 1.0, 2048.0)):
@@ -95,65 +113,72 @@ def _check(rank: int, rendezvous: str) -> None:
                         assert ca.can_tp2_all_reduce_fused_add_rms_norm(
                             x, x_b, residual, weight
                         )
-                        out, res = ca.tp2_all_reduce_fused_add_rms_norm(
-                            x, x_b, residual, weight, EPS, scale
-                        )
-                        ref_out, ref_res = _reference(
-                            ca, x, x_b, residual, weight, scale
-                        )
+                        context = (rows, sum2, scale, seed)
+                        expected = _reference(ca, x, x_b, residual, weight, scale)
+                        actual = fused(x, x_b, residual, weight, EPS, scale)
+                        with ca.capture():
+                            warmup = fused(x, x_b, residual, weight, EPS, scale)
                         torch.accelerator.synchronize()
-                        assert torch.equal(res, ref_res), (rows, sum2, scale, seed)
-                        assert torch.equal(out, ref_out), (rows, sum2, scale, seed)
-                        _assert_same_on_both_ranks(out, res)
+                        _assert_equal(actual, expected, context)
+                        _assert_equal(warmup, expected, context)
+                        _assert_same_on_both_ranks(*actual)
 
-        # CUDA graphs: registered (IPC) inputs, interleaved with ordinary
-        # all-reduces, replayed with one rank late.
-        for rows in (1, 2):
+        # CUDA graphs over operands allocated before capture (static
+        # buffers; with expandable segments they are not IPC-exportable).
+        for rows in (1, 2, 3, 5):
             x = torch.zeros(rows, H, device="cuda", dtype=torch.float16)
             x_b = torch.zeros_like(x)
             residual = torch.zeros_like(x)
             for sum2 in (False, True):
                 for scale in (1.0, 0.125):
                     b = x_b if sum2 else None
-                    ca.tp2_all_reduce_fused_add_rms_norm(
-                        x, b, residual, weight, EPS, scale
-                    )
+                    args = (x, b, residual, weight, EPS, scale)
+                    fused(*args)
                     _reference(ca, x, b, residual, weight, scale)
                     torch.accelerator.synchronize()
                     dist.barrier()
+                    # FULL-style capture: interleaved with ordinary
+                    # all-reduces, then the communicator registers the
+                    # captured collective buffers.
                     graph = torch.cuda.CUDAGraph()
                     with ca.capture(), torch.cuda.graph(graph):
-                        for _ in range(24):
-                            out, res = ca.tp2_all_reduce_fused_add_rms_norm(
-                                x, b, residual, weight, EPS, scale
-                            )
-                            ref_out, ref_res = _reference(
-                                ca, x, b, residual, weight, scale
-                            )
+                        for _ in range(12):
+                            out, res = fused(*args)
+                            ref = _reference(ca, x, b, residual, weight, scale)
+                    # A graph captured without the communicator's context.
+                    bare = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(bare):
+                        for _ in range(12):
+                            bare_out = fused(*args)
                     for cycle in range(6):
+                        context = (rows, sum2, scale, cycle)
                         _fill(rank, 100 + cycle, x, b, residual, weight, 4.0)
                         dist.barrier()
                         if rank == cycle % 2:
                             torch.cuda._sleep(20000)
-                        for _ in range(5):
+                        for _ in range(3):
                             graph.replay()
                         torch.accelerator.synchronize()
-                        assert torch.equal(res, ref_res), (rows, sum2, scale, cycle)
-                        assert torch.equal(out, ref_out), (rows, sum2, scale, cycle)
+                        _assert_equal((out, res), ref, context)
                         _assert_same_on_both_ranks(out, res)
-                        eager_out, eager_res = ca.tp2_all_reduce_fused_add_rms_norm(
-                            x, b, residual, weight, EPS, scale
-                        )
+                        dist.barrier()
+                        if rank != cycle % 2:
+                            torch.cuda._sleep(20000)
+                        for _ in range(3):
+                            bare.replay()
                         torch.accelerator.synchronize()
-                        assert torch.equal(eager_out, out)
-                        assert torch.equal(eager_res, res)
-                    del graph
+                        _assert_equal(bare_out, ref, context)
+                        eager = fused(*args)
+                        torch.accelerator.synchronize()
+                        _assert_equal(eager, ref, context)
+                    del graph, bare
     finally:
         ca.close()
         dist.destroy_process_group()
 
 
-def test_tp2_all_reduce_fused_add_rms_norm(tmp_path):
+@pytest.mark.parametrize("expandable", [False, True])
+def test_sm70_tp2_all_reduce_fused_add_rms_norm(tmp_path, expandable):
     if torch.accelerator.device_count() < 2 or torch.cuda.get_device_capability() != (
         7,
         0,
@@ -167,7 +192,7 @@ def test_tp2_all_reduce_fused_add_rms_norm(tmp_path):
         pytest.skip("the custom all-reduce extension lacks the fused collective")
     mp.spawn(
         _check,
-        args=((tmp_path / "rendezvous").as_uri(),),
+        args=((tmp_path / "rendezvous").as_uri(), expandable),
         nprocs=2,
         join=True,
     )
