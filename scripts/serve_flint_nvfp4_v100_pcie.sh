@@ -19,7 +19,12 @@ up to 2 sequences, GPU memory utilization 0.90, prefix caching with cached
 prompt tokens reported in usage, GLM-4.7 tool-call and reasoning parsers,
 tools dropped from the prompt when tool_choice is "none", served as "flint".
 The model config selects the SM70 attention backend (TRITON_ATTN or
-FLASH_ATTN_V100); --attention-backend is left unset.
+FLASH_ATTN_V100); --attention-backend is left unset. Routed experts run on
+the TurboMind NVFP4 MoE route (--kernel-config.sm70_skinny_moe false): on
+2x V100 PCIe it decodes about 40% faster than the skinny route at 4K and
+prefills 20-30% faster. Pass --kernel-config.sm70_skinny_moe true to
+compare; give other kernel options in the same dotted form, since a JSON
+--kernel-config would be replaced by this default.
 
 Hardware: two V100 PCIe 32GB GPUs, ideally behind one PCIe switch. Check
 `nvidia-smi topo -m`: PIX or PXB between the pair keeps peer traffic on the
@@ -102,6 +107,7 @@ exec "$vllm_cli" serve "$model" \
   "${parallel_args[@]}" --dtype half --kv-cache-dtype auto \
   --max-model-len 262144 --max-num-seqs 2 --max-num-batched-tokens 8192 \
   --gpu-memory-utilization 0.90 \
+  --kernel-config.sm70_skinny_moe false \
   --enable-prefix-caching --enable-prompt-tokens-details \
   --enable-auto-tool-choice --tool-call-parser glm47 --reasoning-parser glm47 \
   --exclude-tools-when-tool-choice-none \
