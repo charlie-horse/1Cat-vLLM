@@ -7,15 +7,24 @@ MoE layer with random ModelOpt NVFP4 weights (packed e2m1 ``[N, K/2]``, e4m3
 block scales ``[N, K/16]``, fp32 global scale).
 
 Backends:
-  turbomind    What Flint runs today: ``sm70_turbomind.prepare_nvfp4_linear``
-               plus ``apply_prepared_linear`` (ModelOpt W4A16 on SM70). For
-               MoE, ``ModelOptNvFp4SM70MoEMethod.apply`` on fixed top-k ids.
+  turbomind    The TurboMind path: layers are loaded with both M<=2 kill
+               switches (``VLLM_SM70_MODELOPT_NVFP4_GEMV`` and
+               ``VLLM_SM70_FLINT_MOE_QPN_DECODE``) set to 0. Dense:
+               ``sm70_turbomind.prepare_nvfp4_linear`` plus
+               ``apply_prepared_linear`` (ModelOpt W4A16 on SM70). MoE:
+               ``ModelOptNvFp4SM70MoEMethod.apply`` on fixed top-k ids.
   qpn2_shared  ``nvfp4_qpn2_tm_dispatch_sm70_out`` over the same TurboMind
                codes with compact E4M3 scales, called through
                ``Qpn2NvFp4LinearKernel.apply_qpn2`` (dense only).
-  new          Optional. Dense: ``torch.ops._C.<--new-op>`` if registered.
-               MoE: re-prepares the layer with ``<--moe-new-env>=1`` if this
-               tree reads that variable. Skipped with a message otherwise.
+  new          The same layer paths loaded with both kill switches set to 1.
+               Dense: the ModelOpt W4A16 preparation admits the single-token
+               GEMV (``nvfp4_tm_gemv_dispatch_sm70_out``) and
+               ``apply_prepared_linear`` runs it. MoE: the layer admits the
+               two-kernel M<=2 routed-expert decode. A layer that does not
+               admit its path is reported as skipped.
+
+Both kill switches are read when a layer is loaded, so each backend gets its
+own freshly prepared layers (same weights) under its own switch values.
 
 Every call is captured in a CUDA graph. Each graph replays several weight
 copies (dense) or routings (MoE) so consecutive calls do not reuse L2 (6 MB
@@ -32,6 +41,7 @@ Example (c4130):
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime
 import json
 import math
@@ -62,6 +72,26 @@ DENSE_SHAPES: dict[str, tuple[int, int]] = {
 MOE_HIDDEN, MOE_INTERMEDIATE, MOE_EXPERTS, MOE_TOP_K = 2048, 512, 256, 6
 
 _E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+DENSE_GLOBAL_SCALE = 0.05 / (6.0 * 448.0)
+
+# M<=2 kill switches, read at layer load time. Backend -> switch value.
+KILL_SWITCHES = ("VLLM_SM70_MODELOPT_NVFP4_GEMV", "VLLM_SM70_FLINT_MOE_QPN_DECODE")
+BACKEND_SWITCHES = {"turbomind": "0", "qpn2_shared": "0", "new": "1"}
+
+
+@contextlib.contextmanager
+def _kill_switches(value: str):
+    """Set both M<=2 kill switches to ``value`` and restore them afterwards."""
+    saved = {name: os.environ.get(name) for name in KILL_SWITCHES}
+    os.environ.update({name: value for name in KILL_SWITCHES})
+    try:
+        yield
+    finally:
+        for name, old in saved.items():
+            if old is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = old
 
 
 # ---------------------------------------------------------------------------
@@ -108,15 +138,18 @@ class _NvFp4Linear(torch.nn.Module):
         )
 
 
-def _prepare_dense_layer(k: int, n: int, gen: torch.Generator) -> _NvFp4Linear:
+def _prepare_dense_layer(
+    k: int, n: int, codes: torch.Tensor, scales: torch.Tensor
+) -> _NvFp4Linear:
+    """Prepare one ModelOpt W4A16 linear under the current kill switches."""
     from vllm import _sm70_ops as sm70_ops
     from vllm.model_executor.kernels.linear.qpn.nvfp4 import _qpn2_config
     from vllm.model_executor.layers.quantization import sm70_turbomind as sm70_tm
 
-    codes, scales = _random_nvfp4(n, k, gen)
-    layer = _NvFp4Linear(k, n, codes, scales, 0.05 / (6.0 * 448.0))
-    # Same preparation as modelopt._try_prepare_sm70_modelopt_nvfp4.
-    sm70_tm.prepare_nvfp4_linear(layer)
+    layer = _NvFp4Linear(k, n, codes.clone(), scales.clone(), DENSE_GLOBAL_SCALE)
+    # Same preparation as ModelOptNvFp4W4A16LinearMethod on SM70: the GEMV is
+    # admitted here, at load time, iff VLLM_SM70_MODELOPT_NVFP4_GEMV allows it.
+    sm70_tm.prepare_nvfp4_linear(layer, single_token_gemv=True)
     # Shared-weight QPN2 attributes, as Qpn2NvFp4LinearKernel attaches them.
     layer.sm70_nvfp4_qpn2_scales = None
     if hasattr(torch.ops._C, "nvfp4_qpn2_prepare_scales_sm70"):
@@ -200,7 +233,10 @@ def _dense_runner(backend: str, layer, x: torch.Tensor, args):
     from vllm.model_executor.kernels.linear.qpn.nvfp4 import Qpn2NvFp4LinearKernel
     from vllm.model_executor.layers.quantization import sm70_turbomind as sm70_tm
 
+    state = getattr(layer, sm70_tm.STATE_ATTR)
     if backend == "turbomind":
+        if state.tm_gemv:
+            return "GEMV admitted although VLLM_SM70_MODELOPT_NVFP4_GEMV=0"
         return lambda: sm70_tm.apply_prepared_linear(layer, x, None)
     if backend == "qpn2_shared":
         if layer.sm70_nvfp4_qpn2_scales is None or not hasattr(
@@ -211,27 +247,12 @@ def _dense_runner(backend: str, layer, x: torch.Tensor, args):
             layer, x, None, gated_silu=False
         )
     if backend == "new":
-        op = getattr(torch.ops._C, args.new_op, None)
-        if op is None:
-            return f"torch.ops._C.{args.new_op} not registered"
-        state = getattr(layer, sm70_tm.STATE_ATTR)
-        n = state.padded_output_size or state.output_size
-        out = torch.empty((x.shape[0], n), dtype=x.dtype, device=x.device)
-        if args.new_signature == "tm":
-            extra = (state.scales, state.group_size, state.k_ld, state.q_ld)
-        else:
-            extra = (
-                layer.sm70_nvfp4_qpn2_scales,
-                layer.sm70_nvfp4_qpn2_global_scale,
-                state.k_ld,
-                state.q_ld,
+        if not state.tm_gemv:
+            return (
+                f"single-token GEMV not admitted (op built: {sm70_tm.has_tm_gemv_op()})"
             )
-
-        def call() -> torch.Tensor:
-            op(out, x, state.weight, *extra)
-            return out[:, : state.output_size]
-
-        return call
+        # The real layer path: provider nvfp4_tm_gemv_dispatch_sm70_out.
+        return lambda: sm70_tm.apply_prepared_linear(layer, x, None)
     return f"unknown backend {backend}"
 
 
@@ -243,12 +264,15 @@ def bench_dense(args, records: list[dict]) -> None:
         copies = max(
             1, min(args.max_copies, math.ceil(args.rotate_mb * 2**20 / weight_bytes))
         )
-        layers = [_prepare_dense_layer(k, n, gen) for _ in range(copies)]
-        ref_w = _dequantize(
-            layers[0].weight.data,
-            layers[0].weight_scale.data,
-            layers[0].sm70_nvfp4_qpn2_global_scale,
-        )
+        raw = [_random_nvfp4(n, k, gen) for _ in range(copies)]
+        ref_w = _dequantize(*raw[0], DENSE_GLOBAL_SCALE)
+        # Layers per kill-switch value; admission is decided at load time.
+        layer_sets: dict[str, list[_NvFp4Linear]] = {}
+        for backend in args.backends:
+            value = BACKEND_SWITCHES.get(backend, "0")
+            if value not in layer_sets:
+                with _kill_switches(value):
+                    layer_sets[value] = [_prepare_dense_layer(k, n, *w) for w in raw]
         for m in args.m:
             x = torch.randn((m, k), generator=gen, device="cuda").half()
             reference = x.float() @ ref_w.t()
@@ -264,6 +288,9 @@ def bench_dense(args, records: list[dict]) -> None:
                     weight_bytes=weight_bytes,
                     copies=copies,
                 )
+                switch = BACKEND_SWITCHES.get(backend, "0")
+                record["kill_switches"] = switch
+                layers = layer_sets[switch]
                 if backend == "qpn2_shared":
                     record["qpn2_split_k"] = layers[0].sm70_nvfp4_qpn2_split_k
                     record["qpn2_nacc"] = layers[0].sm70_nvfp4_qpn2_nacc
@@ -274,9 +301,10 @@ def bench_dense(args, records: list[dict]) -> None:
                     records.append(record)
                     continue
                 try:
-                    out = runners[0]().clone()
-                    torch.cuda.synchronize()
-                    us, mode = _time_calls(runners, args.iters, args.warmup)
+                    with _kill_switches(switch):
+                        out = runners[0]().clone()
+                        torch.cuda.synchronize()
+                        us, mode = _time_calls(runners, args.iters, args.warmup)
                 except Exception as exc:  # noqa: BLE001 - report and continue
                     print(f"  [skip] {name} M={m} {backend}: {exc!r}")
                     record["skipped"] = repr(exc)
@@ -293,7 +321,7 @@ def bench_dense(args, records: list[dict]) -> None:
                     f"  {name:15s} M={m} {backend:12s} {us:8.2f} us "
                     f"{record['gbps']:7.1f} GB/s ({mode}, copies={copies})"
                 )
-        del layers, ref_w
+        del layer_sets, raw, ref_w
         torch.cuda.empty_cache()
 
 
@@ -373,19 +401,6 @@ def _moe_reference(x, weights, ids, raw, intermediate) -> torch.Tensor:
     return out
 
 
-def _env_read_by_tree(name: str) -> bool:
-    import vllm
-
-    root = Path(vllm.__file__).parent
-    for path in root.rglob("*.py"):
-        try:
-            if name in path.read_text(errors="ignore"):
-                return True
-        except OSError:
-            continue
-    return False
-
-
 def _build_moe(raw: dict, tp_size: int):
     from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
     from vllm.model_executor.layers.fused_moe.activation import MoEActivation
@@ -436,40 +451,28 @@ def bench_moe(args, records: list[dict]) -> None:
             weights = (scores / scores.sum(dim=-1, keepdim=True)).contiguous()
             routings[m].append((x, weights, ids.to(torch.int32).contiguous()))
 
-    builders = []
-    for backend in args.backends:
-        if backend == "turbomind":
-            builders.append((backend, None))
-        elif backend == "new":
-            env = args.moe_new_env
-            if not _env_read_by_tree(env):
-                print(f"  [skip] moe new: {env} is not read by this vllm tree")
-                records.append(
-                    dict(kind="moe", backend="new", skipped=f"{env} unknown")
-                )
-                continue
-            builders.append((backend, env))
-        else:
-            print(f"  [skip] moe {backend}: no routed-expert path for this backend")
-
     baselines: dict[int, torch.Tensor] = {}
-    for backend, env in builders:
-        saved = os.environ.get(env) if env else None
-        if env:
-            os.environ[env] = "1"
+    for backend in args.backends:
+        if backend not in ("turbomind", "new"):
+            print(f"  [skip] moe {backend}: no routed-expert path for this backend")
+            continue
+        switch = BACKEND_SWITCHES[backend]
+        # The policy is captured and the decode admitted when the layer loads.
         try:
-            method, layer, vllm_config = _build_moe(raw, tp_size)
+            with _kill_switches(switch):
+                method, layer, vllm_config = _build_moe(raw, tp_size)
         except Exception as exc:  # noqa: BLE001 - report and continue
             print(f"  [skip] moe {backend}: {exc!r}")
             records.append(dict(kind="moe", backend=backend, skipped=repr(exc)))
             continue
-        finally:
-            if env:
-                if saved is None:
-                    os.environ.pop(env, None)
-                else:
-                    os.environ[env] = saved
-        with set_current_vllm_config(vllm_config):
+        admitted = bool(getattr(layer, "sm70_nvfp4_decode_qpn", False))
+        if admitted != (switch == "1"):
+            reason = f"M<=2 decode admitted={admitted} with kill switches={switch}"
+            print(f"  [skip] moe {backend}: {reason}")
+            records.append(dict(kind="moe", backend=backend, skipped=reason))
+            del method, layer
+            continue
+        with _kill_switches(switch), set_current_vllm_config(vllm_config):
             for m in args.m:
                 cases = routings[m]
                 touched = statistics.mean(ids.unique().numel() for _, _, ids in cases)
@@ -489,6 +492,7 @@ def bench_moe(args, records: list[dict]) -> None:
                     k=MOE_HIDDEN,
                     n=2 * intermediate,
                     backend=backend,
+                    kill_switches=switch,
                     weight_bytes=weight_bytes,
                     experts_touched=touched,
                     copies=len(cases),
@@ -594,15 +598,6 @@ def main() -> None:
         default=8,
         help="distinct top-k routings replayed per MoE graph",
     )
-    parser.add_argument("--new-op", default="nvfp4_tm_gemv_sm70_out")
-    parser.add_argument(
-        "--new-signature",
-        choices=("tm", "compact"),
-        default="tm",
-        help="tm: (out, x, tm_weight, tm_scales, group, k_ld, q_ld); "
-        "compact: (out, x, tm_weight, e4m3_scales, global, k_ld, q_ld)",
-    )
-    parser.add_argument("--moe-new-env", default="VLLM_SM70_FLINT_MOE_QPN_DECODE")
     parser.add_argument("--json", type=Path)
     parser.add_argument("--markdown", type=Path)
     args = parser.parse_args()
