@@ -659,10 +659,13 @@ class Sm70MoERoutingPolicy(DeferredExecutionPolicy):
     """Enable the retained E512/K10 exact router at dynamic M1..16."""
     mtp_top16: bool | None = None
     """Use partial selection at the existing FP16 M5/M10 gates."""
+    flint_fused: bool | None = None
+    """Fused FP32-gate E256/K6 sigmoid router for one or two tokens."""
 
     aliases: ClassVar[dict[str, str]] = {
         "exact_topk": "VLLM_SM70_QWEN38_ROUTER_TOPK",
         "mtp_top16": "VLLM_SM70_MTP_ROUTER_TOP16",
+        "flint_fused": "VLLM_SM70_FLINT_FUSED_ROUTER",
     }
 
 

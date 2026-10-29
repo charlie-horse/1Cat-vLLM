@@ -367,6 +367,7 @@ if TYPE_CHECKING:
     VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE: bool = True
     VLLM_SM70_NVFP4_QPN_M1_LIBRARY: str | None = None
     VLLM_SM70_QWEN38_ROUTER_TOPK: bool = True
+    VLLM_SM70_FLINT_FUSED_ROUTER: bool = True
     VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE: bool = False
     VLLM_SM70_AWQ_WARMUP: bool = True
     VLLM_SM70_AWQ_WARMUP_MAX_M: int = 16
@@ -5379,6 +5380,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "Exact single-token E=512, K=10 softmax router used by Qwen3.8 "
             "Flash Next. All other shapes and scoring modes retain the generic"
             " CUDA op."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
+    ),
+    # Fused decode router for the E256/K6 sigmoid MoE with an FP32 gate
+    # [256, 2048] at one or two tokens: FP16 input, FP32 accumulation and
+    # topk_sigmoid's selection in one launch. "0" keeps the FP32 GEMM route.
+    "VLLM_SM70_FLINT_FUSED_ROUTER": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_FLINT_FUSED_ROUTER", "1"))),
+        description=(
+            "Fused SM70 decode router for the E256/K6 renormalized sigmoid "
+            "MoE with an FP32 gate [256, 2048] at one or two tokens: one "
+            "kernel reads the FP16 hidden states and the FP32 gate, "
+            "accumulates in FP32 and selects the top six with topk_sigmoid's "
+            "arithmetic. Set to 0 to keep the FP32 GEMM and topk_sigmoid."
         ),
         category="configuration",
         declared_default="True",
