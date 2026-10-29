@@ -763,6 +763,22 @@ class KernelConfig:
             else qualified
         )
 
+    sm70_flint_qk_rope_kv: bool | None = None
+    """Flint attention on SM70: one kernel for the q/k RMSNorm, the RoPE and
+    the FP16 paged KV-cache write. None resolves from the environment."""
+
+    sm70_flint_qk_rope_kv_aliases: ClassVar[dict[str, str]] = {
+        "sm70_flint_qk_rope_kv": "VLLM_SM70_FLINT_QK_ROPE_KV",
+    }
+
+    def resolve_flint_qk_rope_kv(self) -> None:
+        if self.sm70_flint_qk_rope_kv is not None:
+            return
+        from vllm import envs
+
+        name = self.sm70_flint_qk_rope_kv_aliases["sm70_flint_qk_rope_kv"]
+        self.sm70_flint_qk_rope_kv = bool(envs.environment_variables[name]())
+
     sm70_nvfp4: Sm70NvFp4Config = Field(default_factory=Sm70NvFp4Config)
     """SM70 compressed-tensors NVFP4 policy, resolved per engine."""
 

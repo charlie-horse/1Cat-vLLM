@@ -564,6 +564,7 @@ if TYPE_CHECKING:
     VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL: bool = True
     VLLM_SM70_NVFP4_MOE_GROUPED_EXPERT_ROWS: bool = False
     VLLM_SM70_NVFP4_DENSE_GATED_SILU: bool = True
+    VLLM_SM70_FLINT_QK_ROPE_KV: bool = True
     VLLM_SM70_NVFP4_QPN4: bool = True
     VLLM_SM70_NVFP4_QPN4_DOWN_SCALE_CODE: bool = False
     VLLM_SM70_MODELOPT_NVFP4_GEMV: bool = True
@@ -8609,6 +8610,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("TurboMind NVFP4",),
+        user_visible=False,
+    ),
+    # Flint attention on SM70: one Triton kernel for the per-head q/k
+    # RMSNorm, the NeoX RoPE and the FP16 paged KV-cache write. Set to 0 to
+    # run the separate norm, RoPE and cache-write kernels.
+    "VLLM_SM70_FLINT_QK_ROPE_KV": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_FLINT_QK_ROPE_KV", "1"))),
+        description=(
+            "SM70: Flint fused q/k RMSNorm, RoPE and FP16 paged KV-cache "
+            "write. Set to 0 to run the separate kernels."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
         user_visible=False,
     ),
     # Memory-neutral native QPN4 M=1 decode for the accepted Qwen3.8-27B

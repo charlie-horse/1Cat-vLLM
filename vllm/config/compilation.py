@@ -1169,6 +1169,9 @@ class CompilationConfig:
                         self.pass_config.fuse_rope_kvcache = False
                     self.splitting_ops.append("vllm::unified_kv_cache_update")
                     self.splitting_ops.append("vllm::unified_mla_kv_cache_update")
+                    # Same reason: the fused q/k norm + RoPE + KV-cache update
+                    # op takes the layer name too.
+                    self.splitting_ops.append("vllm::qk_norm_rope_kv_cache_update")
 
             elif len(self.splitting_ops) == 0:
                 if (
