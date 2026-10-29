@@ -738,6 +738,13 @@ void nvfp4_moe_decode_w2_reduce_sm70_out(torch::Tensor out, torch::Tensor input,
                                          torch::Tensor topk_weights,
                                          int64_t scale_shift);
 
+void nvfp4_moe_decode_fused_sm70_out(
+    torch::Tensor out, torch::Tensor activations, torch::Tensor input,
+    torch::Tensor w13_weights, torch::Tensor w13_scales,
+    torch::Tensor w2_weights, torch::Tensor w2_scales, torch::Tensor expert_ids,
+    torch::Tensor topk_weights, torch::Tensor partials, torch::Tensor counters,
+    int64_t w13_scale_shift, int64_t w2_scale_shift);
+
 void nvfp4_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
                                     torch::Tensor expert_offsets,
                                     torch::Tensor dense_expert_ids,

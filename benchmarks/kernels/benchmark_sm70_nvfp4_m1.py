@@ -20,10 +20,15 @@ Backends:
                Dense: the ModelOpt W4A16 preparation admits the single-token
                GEMV (``nvfp4_tm_gemv_dispatch_sm70_out``) and
                ``apply_prepared_linear`` runs it. MoE: the layer admits the
-               two-kernel M<=2 routed-expert decode. A layer that does not
+               two-kernel M<=2 routed-expert decode
+               (``VLLM_SM70_FLINT_MOE_PERSISTENT=0``). A layer that does not
                admit its path is reported as skipped.
+  persistent   MoE only: as ``new`` plus ``VLLM_SM70_FLINT_MOE_PERSISTENT=1``,
+               the single-launch decode (W2 weights prefetched while W13
+               runs). Its output must be bitwise equal to ``new``'s
+               (``new_bitwise`` in the records).
 
-Both kill switches are read when a layer is loaded, so each backend gets its
+The kill switches are read when a layer is loaded, so each backend gets its
 own freshly prepared layers (same weights) under its own switch values.
 
 Every call is captured in a CUDA graph. Each graph replays several weight
@@ -36,6 +41,9 @@ plus one e4m3 scale per 16).
 Example (c4130):
   python benchmarks/kernels/benchmark_sm70_nvfp4_m1.py \\
       --backends turbomind,qpn2_shared,new --json out.json --markdown out.md
+  # Routed experts only: two-kernel vs single-launch decode.
+  python benchmarks/kernels/benchmark_sm70_nvfp4_m1.py --no-dense \\
+      --backends new,persistent
 """
 
 from __future__ import annotations
@@ -74,16 +82,30 @@ MOE_HIDDEN, MOE_INTERMEDIATE, MOE_EXPERTS, MOE_TOP_K = 2048, 512, 256, 6
 _E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 DENSE_GLOBAL_SCALE = 0.05 / (6.0 * 448.0)
 
-# M<=2 kill switches, read at layer load time. Backend -> switch value.
+# M<=2 kill switches, read at layer load time. Backend -> switch value; the
+# single-launch MoE switch is on only for the "persistent" backend.
 KILL_SWITCHES = ("VLLM_SM70_MODELOPT_NVFP4_GEMV", "VLLM_SM70_FLINT_MOE_QPN_DECODE")
-BACKEND_SWITCHES = {"turbomind": "0", "qpn2_shared": "0", "new": "1"}
+PERSISTENT_SWITCH = "VLLM_SM70_FLINT_MOE_PERSISTENT"
+BACKEND_SWITCHES = {
+    "turbomind": "0",
+    "qpn2_shared": "0",
+    "new": "1",
+    "persistent": "1+persistent",
+}
 
 
 @contextlib.contextmanager
 def _kill_switches(value: str):
-    """Set both M<=2 kill switches to ``value`` and restore them afterwards."""
-    saved = {name: os.environ.get(name) for name in KILL_SWITCHES}
-    os.environ.update({name: value for name in KILL_SWITCHES})
+    """Set the M<=2 kill switches for ``value`` and restore them afterwards.
+
+    ``value`` is "0" or "1" for both M<=2 switches (single launch off), or
+    "1+persistent" for both on plus the single-launch MoE decode.
+    """
+    names = (*KILL_SWITCHES, PERSISTENT_SWITCH)
+    saved = {name: os.environ.get(name) for name in names}
+    base = value.split("+")[0]
+    os.environ.update({name: base for name in KILL_SWITCHES})
+    os.environ[PERSISTENT_SWITCH] = "1" if value.endswith("+persistent") else "0"
     try:
         yield
     finally:
@@ -258,6 +280,8 @@ def _dense_runner(backend: str, layer, x: torch.Tensor, args):
 
 def bench_dense(args, records: list[dict]) -> None:
     gen = torch.Generator(device="cuda").manual_seed(args.seed)
+    # "persistent" only changes the routed experts; dense is "new".
+    backends = [b for b in args.backends if b != "persistent"]
     for name in args.shapes:
         k, n = DENSE_SHAPES[name]
         weight_bytes = k * n * BYTES_PER_WEIGHT
@@ -268,7 +292,7 @@ def bench_dense(args, records: list[dict]) -> None:
         ref_w = _dequantize(*raw[0], DENSE_GLOBAL_SCALE)
         # Layers per kill-switch value; admission is decided at load time.
         layer_sets: dict[str, list[_NvFp4Linear]] = {}
-        for backend in args.backends:
+        for backend in backends:
             value = BACKEND_SWITCHES.get(backend, "0")
             if value not in layer_sets:
                 with _kill_switches(value):
@@ -277,7 +301,7 @@ def bench_dense(args, records: list[dict]) -> None:
             x = torch.randn((m, k), generator=gen, device="cuda").half()
             reference = x.float() @ ref_w.t()
             baseline = None
-            for backend in args.backends:
+            for backend in backends:
                 record = dict(
                     kind="dense",
                     name=name,
@@ -452,8 +476,9 @@ def bench_moe(args, records: list[dict]) -> None:
             routings[m].append((x, weights, ids.to(torch.int32).contiguous()))
 
     baselines: dict[int, torch.Tensor] = {}
+    two_kernel: dict[int, torch.Tensor] = {}
     for backend in args.backends:
-        if backend not in ("turbomind", "new"):
+        if backend not in ("turbomind", "new", "persistent"):
             print(f"  [skip] moe {backend}: no routed-expert path for this backend")
             continue
         switch = BACKEND_SWITCHES[backend]
@@ -466,8 +491,12 @@ def bench_moe(args, records: list[dict]) -> None:
             records.append(dict(kind="moe", backend=backend, skipped=repr(exc)))
             continue
         admitted = bool(getattr(layer, "sm70_nvfp4_decode_qpn", False))
-        if admitted != (switch == "1"):
-            reason = f"M<=2 decode admitted={admitted} with kill switches={switch}"
+        persistent = bool(getattr(layer, "sm70_nvfp4_decode_persistent", False))
+        if (admitted, persistent) != (switch != "0", switch.endswith("+persistent")):
+            reason = (
+                f"M<=2 decode admitted={admitted} single-launch={persistent} "
+                f"with kill switches={switch}"
+            )
             print(f"  [skip] moe {backend}: {reason}")
             records.append(dict(kind="moe", backend=backend, skipped=reason))
             del method, layer
@@ -514,6 +543,11 @@ def bench_moe(args, records: list[dict]) -> None:
                     baselines[m] = out
                 elif m in baselines:
                     record["tm_max_abs"], record["tm_rel"] = _errors(out, baselines[m])
+                if backend == "new":
+                    two_kernel[m] = out
+                elif backend == "persistent" and m in two_kernel:
+                    # The single launch must reproduce the two launches exactly.
+                    record["new_bitwise"] = bool(torch.equal(out, two_kernel[m]))
                 records.append(record)
                 print(
                     f"  moe_routed      M={m} {backend:12s} {us:8.2f} us "
@@ -560,6 +594,8 @@ def markdown(records: list[dict], header: dict) -> str:
         note = [r.get("mode", "")]
         if "qpn2_split_k" in r:
             note.append(f"split_k={r['qpn2_split_k']} nacc={r['qpn2_nacc']}")
+        if "new_bitwise" in r:
+            note.append(f"bitwise vs new: {r['new_bitwise']}")
         if "experts_touched" in r:
             note.append(f"{r['experts_touched']:.1f} experts")
         vs_tm = (

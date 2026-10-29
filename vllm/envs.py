@@ -352,6 +352,7 @@ if TYPE_CHECKING:
     VLLM_SM70_NVFP4_QWEN38_TP4_M1_FAST_SELECTOR: bool = True
     VLLM_SM70_NVFP4_QWEN38_MOE_QPN_M1_DECODE: bool = True
     VLLM_SM70_FLINT_MOE_QPN_DECODE: bool = True
+    VLLM_SM70_FLINT_MOE_PERSISTENT: bool = True
     VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_DECODE: bool = True
     VLLM_SM70_NVFP4_QWEN38_MOE_QPN_DYNAMIC_DECODE: bool = False
     VLLM_SM70_NVFP4_MOE_GROUPED_DECODE: bool = False
@@ -5078,6 +5079,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "banks and routing on device. FP32 accumulation, FP16 boundaries "
             "and deterministic reductions. Set to 0 to keep the TurboMind "
             "routes."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind NVFP4",),
+        user_visible=False,
+    ),
+    # Single-launch form of the Flint M<=2 routed-expert decode above: W2
+    # blocks load their weights while W13 runs and wait on a device-side flag,
+    # bitwise equal to the two launches. "0" keeps the two launches.
+    "VLLM_SM70_FLINT_MOE_PERSISTENT": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_FLINT_MOE_PERSISTENT", "1"))),
+        description=(
+            "Run the Flint NVFP4 TP2 M<=2 routed-expert decode as one launch: "
+            "W2 blocks prefetch their weights while W13 runs and wait on a "
+            "device-side flag for the SwiGLU activations. Same arithmetic and "
+            "bitwise-identical output as the two-kernel decode. Applies only "
+            "where VLLM_SM70_FLINT_MOE_QPN_DECODE admits a layer. Set to 0 to "
+            "keep the two launches."
         ),
         category="configuration",
         declared_default="True",

@@ -119,11 +119,12 @@ _QWEN38_DYNAMIC_QPN_BATCH_W13_SPLIT_K: Final = {
 _QWEN38_QPN_BATCH_FUSED_W13_TOKENS: Final = frozenset((4, 8, 16))
 # Two-kernel M<=2 routed-expert decode. Local contract (experts, hidden,
 # local intermediate, top-k) of the native instance: Flint at TP2. The split-K
-# workspace sizes match nvfp4_moe_decode_qpn_sm70.cu.
+# workspace sizes match nvfp4_moe_decode_qpn_sm70.cu: 96 W13 arrival counters,
+# then 32 for the single-launch flags (two ready flags and an exit ticket).
 _DECODE_QPN_CONTRACTS: Final = frozenset({(256, 2048, 256, 6)})
 _DECODE_QPN_MAX_TOKENS: Final = 2
 _DECODE_QPN_PARTIALS: Final = 98304
-_DECODE_QPN_COUNTERS: Final = 96
+_DECODE_QPN_COUNTERS: Final = 96 + 32
 # The decode kernels form prepared_scale * 2^(14 - shift) in FP16.
 _FP16_MAX: Final = 65504.0
 _DECODE_QPN_MAX_SHIFT: Final = 14
@@ -227,6 +228,7 @@ def _prepare_decode_qpn(
     384 KiB split-K workspace and two scale shifts per layer.
     """
     layer.sm70_nvfp4_decode_qpn = False
+    layer.sm70_nvfp4_decode_persistent = False
     layer.sm70_nvfp4_decode_w13_scale_shift = 0
     layer.sm70_nvfp4_decode_w2_scale_shift = 0
     policy = _nvfp4_policy(layer)
@@ -276,14 +278,34 @@ def _prepare_decode_qpn(
     layer.sm70_nvfp4_decode_w13_scale_shift = w13_shift
     layer.sm70_nvfp4_decode_w2_scale_shift = w2_shift
     layer.sm70_nvfp4_decode_qpn = True
+    layer.sm70_nvfp4_decode_persistent = _admit_decode_persistent(policy, native_ops)
     logger.info_once(
-        "SM70 NVFP4 two-kernel M<=2 routed-expert decode enabled "
+        "SM70 NVFP4 %s M<=2 routed-expert decode enabled "
         "(hidden=%d, local_intermediate=%d, experts=%d, top_k=%d).",
+        "single-launch" if layer.sm70_nvfp4_decode_persistent else "two-kernel",
         contract[1],
         contract[2],
         contract[0],
         contract[3],
     )
+
+
+def _admit_decode_persistent(policy, native_ops) -> bool:
+    """Run the admitted M<=2 decode as one launch (bitwise-equal output)."""
+    if not getattr(policy, "flint_persistent_decode", False):
+        return False
+    if native_ops.has_nvfp4_moe_decode_fused_dispatch():
+        return True
+    if "flint_persistent_decode" in policy.explicit_fields:
+        raise RuntimeError(
+            "VLLM_SM70_FLINT_MOE_PERSISTENT=1 requires the TurboMind extension "
+            "with nvfp4_moe_decode_fused_sm70_out."
+        )
+    logger.warning_once(
+        "The SM70 NVFP4 single-launch M<=2 decode op is absent from the "
+        "loaded extension; keeping the two-kernel decode."
+    )
+    return False
 
 
 def _use_glm53_qpn_w13_q8(
@@ -1419,6 +1441,10 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             )
             return output
         if _use_decode_qpn(layer, x, topk_weights, topk_ids):
+            if getattr(layer, "sm70_nvfp4_decode_persistent", False):
+                # One launch, bitwise equal to the two-kernel plan below.
+                layer.sm70_fp4_codec.decode_fused(buffers, x, topk_ids, topk_weights)
+                return output
             plan = select_fp4_stage_plan(Stage.DECODE_QPN, Stage.DECODE_REDUCE)
             return execute_fp4(
                 layer.sm70_fp4_codec, plan, buffers, x, topk_ids, topk_weights

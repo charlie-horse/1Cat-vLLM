@@ -671,6 +671,125 @@ def test_decode_qpn_kill_switch_env(monkeypatch):
     assert disabled.flint_qpn_decode is False
 
 
+# Single-launch form of the M<=2 decode (VLLM_SM70_FLINT_MOE_PERSISTENT).
+
+
+def _prepare_persistent(layer, *, enabled=True, fused=True, explicit=()):
+    layer.sm70_moe_policy.flint_persistent_decode = enabled
+    layer.sm70_moe_policy.explicit_fields = explicit
+    native = NS(
+        has_nvfp4_moe_decode_dispatch=lambda: True,
+        has_nvfp4_moe_decode_fused_dispatch=lambda: fused,
+    )
+    moe._prepare_decode_qpn(layer, native, FLINT_TP2_LOCAL, supported=True)
+
+
+def test_decode_persistent_load_admits_with_flag_workspace():
+    layer = _decode_load_layer()
+    _prepare_persistent(layer)
+    assert layer.sm70_nvfp4_decode_qpn and layer.sm70_nvfp4_decode_persistent
+    # 96 W13 arrival counters plus the ready flags and exit ticket, all zero.
+    assert layer._nvfp4_decode_counters.shape == (128,)
+    assert not layer._nvfp4_decode_counters.any()
+
+
+@pytest.mark.parametrize(("enabled", "fused"), [(False, True), (True, False)])
+def test_decode_persistent_falls_back_to_two_kernels(enabled, fused):
+    layer = _decode_load_layer()
+    _prepare_persistent(layer, enabled=enabled, fused=fused)
+    assert layer.sm70_nvfp4_decode_qpn
+    assert not layer.sm70_nvfp4_decode_persistent
+
+
+def test_decode_persistent_needs_the_two_kernel_admission():
+    layer = _decode_load_layer()
+    layer.sm70_moe_policy.flint_qpn_decode = False
+    _prepare_persistent(layer)
+    assert not layer.sm70_nvfp4_decode_qpn
+    assert not layer.sm70_nvfp4_decode_persistent
+
+
+def test_decode_persistent_explicit_request_fails_closed_without_op():
+    layer = _decode_load_layer()
+    with pytest.raises(RuntimeError, match="VLLM_SM70_FLINT_MOE_PERSISTENT"):
+        _prepare_persistent(layer, fused=False, explicit=("flint_persistent_decode",))
+
+
+def test_decode_persistent_kill_switch_env(monkeypatch):
+    from vllm.config.sm70_moe import Sm70NvFp4MoEConfig
+
+    monkeypatch.delenv("VLLM_SM70_FLINT_MOE_PERSISTENT", raising=False)
+    default = Sm70NvFp4MoEConfig()
+    default.resolve()
+    assert default.flint_persistent_decode is True
+    monkeypatch.setenv("VLLM_SM70_FLINT_MOE_PERSISTENT", "0")
+    disabled = Sm70NvFp4MoEConfig()
+    disabled.resolve()
+    assert disabled.flint_persistent_decode is False
+
+
+@pytest.mark.parametrize("tokens", (1, 2))
+def test_flint_apply_persistent_decode_is_one_native_call(monkeypatch, tokens):
+    _patch_sort_workspace(monkeypatch)
+    hidden = FLINT[0]
+    codec = Mock()
+    layer = _loaded_layer(
+        FLINT, 2, sm70_nvfp4_decode_persistent=True, sm70_fp4_codec=codec
+    )
+    NvFp4MoEWorkspace.allocate(layer)
+    method = object.__new__(moe.ModelOptNvFp4SM70MoEMethod)
+    method.native_ops = Mock()
+    execute = Mock()
+    monkeypatch.setattr(moe, "execute_fp4", execute)
+    monkeypatch.setattr(moe, "is_exact_sm70_cuda", lambda *a, **k: True)
+    monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda self: True))
+    x, ids, weights = _route_inputs(tokens)
+
+    output = method.apply(layer, x, weights, ids, None, None)
+
+    execute.assert_not_called()
+    codec.decode_fused.assert_called_once()
+    buffers, x_arg, ids_arg, weights_arg = codec.decode_fused.call_args.args
+    assert (x_arg, ids_arg, weights_arg) == (x, ids, weights)
+    assert output is buffers["output"]
+    assert output.shape == (tokens, hidden)
+    assert buffers["intermediate"].shape == (tokens * 6, 256)
+
+
+def test_codec_decode_fused_passes_both_banks_and_workspace():
+    from vllm.model_executor.layers.fused_moe.sm70.fp4_codec import Fp4MoECodec
+
+    names = ("w13_tm_weight", "w13_tm_scales", "w2_tm_weight", "w2_tm_scales")
+    owner = NS(
+        **{name: torch.empty(1) for name in names},
+        _nvfp4_decode_partials=torch.empty(2),
+        _nvfp4_decode_counters=torch.empty(3),
+        decode_w13_scale_shift=1,
+        decode_w2_scale_shift=2,
+    )
+    operators = Mock()
+    codec = Fp4MoECodec("nvfp4", owner, owner, bindings=operators)
+    buffers = {"output": torch.empty(1, 4), "intermediate": torch.empty(6, 4)}
+    ids = torch.zeros(1, 6, dtype=torch.int32)
+    weights = torch.zeros(1, 6)
+    x = torch.empty(1, 4)
+
+    codec.decode_fused(buffers, x, ids, weights)
+
+    args = operators.nvfp4_moe_decode_fused_sm70_out.call_args.args
+    expected = (
+        buffers["output"],
+        buffers["intermediate"],
+        x,
+        *(getattr(owner, name) for name in names),
+    )
+    assert all(a is b for a, b in zip(args[:7], expected))
+    assert args[7].shape == (6,) and args[8] is weights
+    assert args[9] is owner._nvfp4_decode_partials
+    assert args[10] is owner._nvfp4_decode_counters
+    assert args[11:] == (1, 2)
+
+
 @pytest.mark.parametrize("tp_size", (1, 2))
 @pytest.mark.parametrize("tokens", (1, 2, 8, 13, 14, 18, 19, 128))
 def test_flint_apply_takes_generic_turbomind_routes(monkeypatch, tp_size, tokens):
@@ -1166,3 +1285,161 @@ def test_flint_decode_qpn_kill_switch_keeps_turbomind(monkeypatch):
         actual = method.apply(layer, x, weights, ids, None, None)
         expected = _reference_moe(x, weights, ids, raw, 256)
         assert _relative_error(actual, expected) < 1e-2
+
+
+# ---------------------------------------------------------------------------
+# GPU: single-launch M<=2 decode against the two-kernel decode, bitwise
+# ---------------------------------------------------------------------------
+
+
+def _requires_fused_decode_op():
+    _requires_decode_ops()
+    if not hasattr(torch.ops._C, "nvfp4_moe_decode_fused_sm70_out"):
+        pytest.skip("requires the SM70 NVFP4 single-launch decode extension")
+
+
+def _decode_apply(method, layer, x, weights, ids, *, persistent: bool):
+    """Output and SwiGLU activations of one path, cloned."""
+    saved = layer.sm70_nvfp4_decode_persistent
+    layer.sm70_nvfp4_decode_persistent = persistent
+    try:
+        out = method.apply(layer, x, weights, ids, None, None).clone()
+        buffers = NvFp4MoEWorkspace.get(layer, x.shape[0], False)
+        return out, buffers["intermediate"].clone()
+    finally:
+        layer.sm70_nvfp4_decode_persistent = saved
+
+
+def _persistent_layer(raw, monkeypatch):
+    monkeypatch.delenv("VLLM_SM70_FLINT_MOE_QPN_DECODE", raising=False)
+    monkeypatch.delenv("VLLM_SM70_FLINT_MOE_PERSISTENT", raising=False)
+    method, layer = _prepared_flint_layer(raw)
+    assert layer.sm70_nvfp4_decode_qpn
+    assert layer.sm70_nvfp4_decode_persistent, "default must admit one launch"
+    return method, layer
+
+
+@requires_sm70
+@pytest.mark.parametrize("w2_global", (0.04, 7.0), ids=("checkpoint", "x16_w2"))
+def test_flint_decode_persistent_is_bitwise_two_kernel(monkeypatch, w2_global):
+    """Same output and activations as the two launches, at M=1 and M=2.
+
+    Covers distinct and shared expert sets across the two tokens, a repeated
+    expert within a token, invalid IDs, and the W2 scale pre-shift.
+    """
+    _requires_fused_decode_op()
+    generator = torch.Generator().manual_seed(20261030)
+    raw = _flint_expert_weights(256, generator)
+    raw["w2_weight_scale_2"].fill_(w2_global)
+    with set_current_vllm_config(_vllm_config("cuda")):
+        method, layer = _persistent_layer(raw, monkeypatch)
+        if w2_global > 1:
+            assert layer.sm70_nvfp4_decode_w2_scale_shift > 0
+        for case in range(12):
+            tokens = 1 + case % 2
+            x, weights, ids = _flint_routing(tokens, generator)
+            if case == 3:
+                ids[1] = ids[0]  # both tokens on the same six experts
+            if case == 5:
+                ids[0, 4] = ids[0, 1]  # one expert twice in a token
+            if case == 7:
+                ids[0, 2] = -1
+                ids[1, 5] = 256
+            two, two_act = _decode_apply(
+                method, layer, x, weights, ids, persistent=False
+            )
+            one, one_act = _decode_apply(
+                method, layer, x, weights, ids, persistent=True
+            )
+            torch.accelerator.synchronize()
+            assert torch.equal(one_act, two_act), case
+            assert torch.equal(one, two), case
+            valid = (ids >= 0) & (ids < 256)
+            expected = _reference_moe(
+                x, weights * valid, torch.where(valid, ids, 0), raw, 256
+            )
+            assert _relative_error(one, expected) < 1e-2, case
+        assert not layer._nvfp4_decode_counters.any()
+
+
+@requires_sm70
+def test_flint_decode_persistent_cuda_graph_replay(monkeypatch):
+    """Captured single launches over several layers replay without a reset.
+
+    Four layers are captured back to back per graph (as decode replays one
+    launch per MoE layer), replayed many times with new inputs and compared
+    bitwise with the eager two-kernel path. The ready flags, exit ticket and
+    arrival counters must all be zero after every replay.
+    """
+    _requires_fused_decode_op()
+    generator = torch.Generator().manual_seed(12)
+    raws = [_flint_expert_weights(256, generator) for _ in range(4)]
+    with set_current_vllm_config(_vllm_config("cuda")):
+        prepared = [_persistent_layer(raw, monkeypatch) for raw in raws]
+        for tokens in (1, 2):
+            static = [t.clone() for t in _flint_routing(tokens, generator)]
+            for method, layer in prepared:  # warm up outside capture
+                method.apply(layer, *static, None, None)
+            torch.accelerator.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                captured = [
+                    method.apply(layer, *static, None, None)
+                    for method, layer in prepared
+                ]
+            for _ in range(4):
+                case = _flint_routing(tokens, generator)
+                for buffer, value in zip(static, case):
+                    buffer.copy_(value)
+                for _ in range(25):
+                    graph.replay()
+                replayed = [out.clone() for out in captured]
+                torch.accelerator.synchronize()
+                for (method, layer), out in zip(prepared, replayed):
+                    assert not layer._nvfp4_decode_counters.any(), tokens
+                    two, _ = _decode_apply(method, layer, *case, persistent=False)
+                    assert torch.equal(out, two), tokens
+
+
+@requires_sm70
+def test_flint_decode_persistent_kill_switch_keeps_two_kernels(monkeypatch):
+    _requires_fused_decode_op()
+    monkeypatch.setenv("VLLM_SM70_FLINT_MOE_PERSISTENT", "0")
+    generator = torch.Generator().manual_seed(4)
+    raw = _flint_expert_weights(256, generator)
+    with set_current_vllm_config(_vllm_config("cuda")):
+        method, layer = _prepared_flint_layer(raw)
+        assert layer.sm70_nvfp4_decode_qpn
+        assert not layer.sm70_nvfp4_decode_persistent
+        x, weights, ids = _flint_routing(1, generator)
+        actual = method.apply(layer, x, weights, ids, None, None)
+        expected = _reference_moe(x, weights, ids, raw, 256)
+        assert _relative_error(actual, expected) < 1e-2
+
+
+@requires_sm70
+def test_flint_decode_fused_op_rejects_short_flag_workspace():
+    _requires_fused_decode_op()
+    from vllm import _sm70_ops as sm70_ops
+
+    generator = torch.Generator().manual_seed(5)
+    raw = _flint_expert_weights(256, generator)
+    with set_current_vllm_config(_vllm_config("cuda")):
+        _, layer = _prepared_flint_layer(raw)
+        x, weights, ids = _flint_routing(1, generator)
+        with pytest.raises(RuntimeError, match="split-K workspace"):
+            sm70_ops.nvfp4_moe_decode_fused_sm70_out(
+                torch.empty(1, 2048, dtype=torch.float16, device="cuda"),
+                torch.empty(6, 256, dtype=torch.float16, device="cuda"),
+                x,
+                layer.w13_tm_weight,
+                layer.w13_tm_scales,
+                layer.w2_tm_weight,
+                layer.w2_tm_scales,
+                ids.view(-1),
+                weights,
+                layer._nvfp4_decode_partials,
+                torch.zeros(96, dtype=torch.int32, device="cuda"),
+                0,
+                0,
+            )

@@ -103,6 +103,26 @@ class Fp4MoECodec:
             op = self._op(stage, "qpn", qpn_mtp=plan.qpn_mtp)
             op(*args, split_k)
 
+    def decode_fused(self, buffers, x, topk_ids, topk_weights) -> None:
+        """The M<=2 decode_qpn + decode_reduce stages in one native launch.
+
+        Same buffers, workspace and arithmetic as the two stages, so the
+        output in ``buffers["output"]`` is bitwise identical.
+        """
+        self.operators.nvfp4_moe_decode_fused_sm70_out(
+            buffers["output"],
+            buffers["intermediate"],
+            x,
+            *self._bank("w13"),
+            *self._bank("w2"),
+            topk_ids.view(-1),
+            topk_weights,
+            self.weights._nvfp4_decode_partials,
+            self.weights._nvfp4_decode_counters,
+            self.dimensions.decode_w13_scale_shift,
+            self.dimensions.decode_w2_scale_shift,
+        )
+
     def gemm_w13(
         self,
         plan: Sm70MoeRoutePlan,

@@ -1477,6 +1477,17 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("nvfp4_moe_decode_w2_reduce_sm70_out", torch::kCUDA,
            vllm::sm70::with_policy(&nvfp4_moe_decode_w2_reduce_sm70_out));
 
+  // Both stages above in one launch (bitwise equal to the two launches).
+  ops.def(
+      "nvfp4_moe_decode_fused_sm70_out("
+      "Tensor(a!) out, Tensor(b!) activations, Tensor input, "
+      "Tensor w13_weights, Tensor w13_scales, Tensor w2_weights, "
+      "Tensor w2_scales, Tensor expert_ids, Tensor topk_weights, "
+      "Tensor(c!) partials, Tensor(d!) counters, int w13_scale_shift, "
+      "int w2_scale_shift, str? native_policy=None ) -> ()");
+  ops.impl("nvfp4_moe_decode_fused_sm70_out", torch::kCUDA,
+           vllm::sm70::with_policy(&nvfp4_moe_decode_fused_sm70_out));
+
   ops.def(
       "nvfp4_moe_dense_stage_sm70_out("
       "Tensor(a!) out, Tensor input, Tensor expert_offsets, "

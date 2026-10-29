@@ -470,6 +470,7 @@ NVFP4_ALIASES = {
     "glm53_fused_permute": "VLLM_SM70_GLM53_MOE_FUSED_PERMUTE_Q8",
     "glm53_qpn_w13": "VLLM_SM70_GLM53_MOE_QPN_W13_Q8",
     "flint_qpn_decode": "VLLM_SM70_FLINT_MOE_QPN_DECODE",
+    "flint_persistent_decode": "VLLM_SM70_FLINT_MOE_PERSISTENT",
 }
 
 MXFP4_ALIASES = {
@@ -583,6 +584,8 @@ class Sm70NvFp4MoEConfig(Sm70MoELegacyConfig):
     """Initialization override for VLLM_SM70_GLM53_MOE_QPN_W13_Q8."""
     flint_qpn_decode: bool | None = None
     """Initialization override for VLLM_SM70_FLINT_MOE_QPN_DECODE."""
+    flint_persistent_decode: bool | None = None
+    """Initialization override for VLLM_SM70_FLINT_MOE_PERSISTENT."""
     route_debug: bool | None = None
     """Historical Qwen route diagnostic, excluded from the calculation hash."""
 
