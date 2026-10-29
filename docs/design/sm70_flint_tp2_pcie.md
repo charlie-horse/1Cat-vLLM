@@ -8,9 +8,8 @@ upstream implementation targets SM100 with BF16 and its own CuTe/Triton
 kernels. This port keeps none of those kernels and uses the fork's SM70
 routes instead.
 
-Status: design and runbook. Every measured value below is **TBD** until
-`tools/flint/sm70_validate.sh` has run on the target host. Fill each table from
-that run's `summary.md` and record the source revision. The projections in
+Status: validated on the target host on 2026-10-28; see [Results](#results).
+Values not measured yet are marked **TBD**. The projections in
 [Expected costs](#expected-costs) are arithmetic estimates, not measurements.
 Do not quote them as results.
 
@@ -65,6 +64,34 @@ The published NVFP4 GGUF is converted once, offline, into ModelOpt safetensors:
 The convert stage of the runbook checks all of this from the safetensors
 headers: dtypes, sink count, expert count, scales, the absence of BF16 and the
 quantization config.
+
+### FP16 headroom
+
+Flint was trained in BF16. In FP16 one massive-activation token per sequence
+overflows in layer 46 unless the model rescales two places at load time
+(`vllm/models/flint/model.py`, FP16 only):
+
+- **MoE intermediate.** Two routed experts of layer 46 reach
+  `silu(gate) * up` of 9.1e4 and 9.4e4, above the FP16 maximum of 65504,
+  while gate and up (≤ 2.4e3), the expert outputs (≤ 8.2e3) and the MoE
+  output (7.3e3) fit. The FP16 intermediate between the W13 and W2 GEMMs
+  became inf, the token's hidden state NaN, and generation degenerated. Every
+  MoE up projection (routed and shared experts) is divided by 16 and its down
+  projection multiplied by 16. In NVFP4 this moves up's E4M3 block scales, so
+  gate and up keep one global scale and the skinny route stays admitted, and
+  down's FP32 global scale. On this checkpoint 2.5e-4 of the shifted block
+  scales round, with a scale-weighted relative error of 6e-9.
+- **Residual stream.** From layer 46 on, the MoE output and the residual
+  stream reach 3.1e4, 2.1x below the FP16 maximum. The stream from layer 46 on
+  is carried divided by 8: layer 46 scales its residual after the attention
+  add, layers 47 and 48 scale their attention output, and the MoE down scales
+  of layers 46 to 48 are divided by 8. Every RMSNorm, the final one included,
+  is invariant to the scale. The audit's logits are the same with and without
+  it (max 87.7).
+
+Both are powers of two, so they only move exponents. The FP16 range audit is
+the gate: after the change the largest value anywhere is 3.9e3, 16.8x below
+the FP16 maximum.
 
 ### Serving flags
 
@@ -216,8 +243,9 @@ Per GPU at TP2. The usable budget at `--gpu-memory-utilization 0.90` is about
 | Full-attention KV, FP16 | 14 KiB/token → 3.5 GiB at 262,144 tokens | 14 layers × 2 local KV heads × 128 × 2 (K, V) × 2 B = 14,336 B |
 | Sliding KV, FP16 | 35 KiB/token over (513 + scheduled tokens) per running request: ≈ 0.3 GiB with an 8192-token chunk, ≈ 18 MiB while decoding | 35 layers × 2 local KV heads × 128 × 2 × 2 B, bounded by the 513 window |
 | Two 262K requests | ≈ 7.6 GiB of KV | max-num-seqs 2 |
-| Activations, workspaces, CUDA graphs, collectives | TBD | Measure: free memory after load, and graph capture size |
-| KV pool reported by the server | TBD | `GPU KV cache size: N tokens` in the server log |
+| Weights measured after load | 11.02 GiB | `Model loading took 11.02 GiB` (TP2, skinny MoE) |
+| Activations, workspaces, CUDA graphs, collectives | ≈ 0.6 GB | Startup budget: activation peak 0.40 GB, warmup 0.11 GB, idle 0.06 GB, non-torch 0.05 GB; graphs for batch 1 and 2 only |
+| KV pool reported by the server | 18.27 GB, 1,067,772 tokens | `GPU KV cache size` at `--gpu-memory-utilization 0.90`; 4.07 requests of 262,144 tokens. 29.6 GiB in use per GPU in `nvidia-smi` |
 
 FP16 KV fits with a wide margin, so FP8 KV is not used: E4M3 does not compile
 in Triton on SM70, and FP16 avoids a second numerical change. PP2 holds about
@@ -256,6 +284,19 @@ tools/flint/sm70_validate.sh --stage smoke,quality,agent \
 | agent | `tools/flint/agent_e2e.py`: multi-turn agent with `list_dir`, `read_file` and `run_python` in a temporary workspace | Tool calls parse, reasoning re-sent in history reaches the prompt, `cached_tokens` > 0 on every later turn, `tool_choice="none"` returns text only, streamed tool call assembles, correct final answer |
 | bench | `vllm bench serve` with random prompts, one request at a time, 1 cold + 3 measured requests, 256 output tokens with `--ignore-eos`, at 4K/32K/128K, for each configuration | Every configuration starts and reports TTFT and decode tok/s |
 
+On a NixOS host without system Python or compilers (the reference host),
+the build stage's `uv` commands do not apply. There the fork was built in
+place against the host's Nix vLLM environment (Torch 2.10.0+cu128, CUDA
+12.8, GCC 14 from the service wrapper's exports), with `python setup.py
+build_ext --inplace` in `flash-attention-v100/` and then in the repository
+root (`TORCH_CUDA_ARCH_LIST=7.0`, `CMAKE_CUDA_ARCHITECTURES=70`,
+`CMAKE_ARGS=-DPython3_EXECUTABLE=<env python>`, `cmake`, `git` and `patchelf`
+from `nix shell`). A `.venv/bin/python` shim sets `PYTHONPATH` to the
+repository and `flash-attention-v100/` so they shadow the installed wheel,
+and a `.venv/bin/vllm` shim runs `python -m vllm.entrypoints.cli.main`. The
+runbook's other stages then run unchanged. The full build takes about 25
+minutes with `MAX_JOBS=24`.
+
 The benchmark drops the first request of each length. `vllm bench serve`
 reuses that request's prompt for warmups and for its readiness check, which
 would turn it into a prefix-cache hit. A distinct seed per length keeps the
@@ -267,73 +308,111 @@ one-way matrix runs `tp2-flash-skinny` plus one change per factor, and
 
 ## Results
 
-All TBD. Record the source revision, driver, clocks and power limits from the
-topology stage with every table.
+Measured on 2026-10-28 on the reference host:
+
+| Item | Value |
+| --- | --- |
+| Host | 2× Tesla V100-PCIE-32GB on one PCIe switch, driver 580.159.03, 250 W, max clocks 1380 MHz SM / 877 MHz memory; 48 CPUs, 125 GB RAM, NixOS 26.05 |
+| Software | Torch 2.10.0+cu128, nvcc 12.8.93, GCC 14.4, CMake 4.1.6, Python 3.12.14; in-place source build |
+| Source | `claude/flint-v100-pcie`; the fixes found on the GPU are in the commits after `8a77063` |
+| Checkpoint | `RecursiveSI/flint-nvfp4-gguf` at `6ec43e19b565fc8d560e2d04985d7724f20673bf`, converted with `--hf-config` from `RecursiveSI/flint` at `2a247be0c0aec895ccb0ac7ca92229ec6df37288` |
+| Serving | The serve script's profile (TP2, `FLASH_ATTN_V100` chosen automatically, skinny NVFP4 MoE, FP16 KV, 262,144 tokens, utilization 0.90, FULL decode CUDA graphs) |
 
 ### Topology and communication
 
 | Measurement | GPU 0 → 1 | GPU 1 → 0 |
 | --- | --- | --- |
-| `nvidia-smi topo -m` link | TBD | TBD |
-| `can_device_access_peer` | TBD | TBD |
-| vLLM CUDA IPC P2P test | TBD | TBD |
-| Device copy GB/s (256 MiB) | TBD | TBD |
-| Custom all-reduce enabled | TBD | TBD |
-| Eager 4 KiB all-reduce µs | TBD | TBD |
+| `nvidia-smi topo -m` link | PIX; P2P read and write OK; PCIe Gen3 x16 | PIX |
+| `can_device_access_peer` | True | True |
+| vLLM CUDA IPC P2P test | True | True |
+| Device copy GB/s (256 MiB) | 13.14 | 13.16 |
+| Custom all-reduce enabled | True, results correct | True, results correct |
+| Eager 4 KiB all-reduce µs | 160.8 (eager Python loop with a clone per call, not a graph replay) | 160.7 |
+
+### Build and conversion
+
+| Check | Result |
+| --- | --- |
+| Flash-V100 extension | Builds without changes. `SUPPORTS_SINKS` is True; both native sink entries exist |
+| Register use (`cuobjdump -res-usage`) | D128 generic paged prefill: 64 registers, 128 to 192 bytes of stack, identical to the 1.5.1 wheel, so the sink epilogue adds no spills. Decode reducer: 32 registers, no stack, also unchanged |
+| Conversion | 1 min 58 s, peak RSS 24.7 GB, 21.71 GiB in 5 shards, 109,613 tensors. All fused q/k/v and gate/up groups already share `weight_scale_2`, so unification is a no-op. `lm_head.weight_scale_2` is 1.256e-3 |
+| Checkpoint check | 49 FP32 sinks, 36,096 expert projections, no BF16, NVFP4 scale dtypes, ModelOpt `W4A16_NVFP4` group 16 |
+| ModelOpt W4A16 NVFP4 on SM70 | Admitted: `get_min_capability` returns 70 with the default SM70 NVFP4 format policy |
 
 ### Kernels and FP16 range
 
 | Check | Result |
 | --- | --- |
-| Sink prefill vs torch reference (SWA 513, D128, GQA 8:1, FP16 KV, chunked prefill, one and many KV tiles; D128 has no split-KV prefill) | TBD |
-| Sink decode vs torch reference, including split-KV | TBD |
-| `sinks=None` unchanged | TBD |
-| MoE contract `(2048, 512, 256, 6)` | TBD |
-| Flash-V100 and skinny MoE regression subset | TBD |
-| FP16 range audit: max residual, MoE output and attention logits | TBD |
+| Sink prefill vs torch reference (SWA 513, D128, GQA 8:1, FP16 KV, chunked prefill, one and many KV tiles; D128 has no split-KV prefill) | Pass (`test_sm70_flash_v100_sinks_prefill.py`) |
+| Sink decode vs torch reference, including split-KV | Pass: 77 GPU cases incl. 64K context, every partition size and CUDA graph replay |
+| `sinks=None` unchanged | Pass: bit-identical decode, sink-free routes unchanged |
+| MoE contract `(2048, 512, 256, 6)` | Pass, 110 tests, after the TurboMind split-K fix (11 to 13 tokens failed before) |
+| Flash-V100 and skinny MoE regression subset | 45 of 45 Flash-V100; 64 skinny MoE pass, 13 skipped (need SM75) |
+| In-engine attention vs FP32 reference (1,496-token prefill, layers 2, 5, 20, 21, both ranks) | Relative error 2e-4 with the sinks and window 513; dropping the sinks gives 0.1 to 0.8 |
+| In-engine MoE vs FP32 dequantized reference (layers 2 to 46, every token) | Median relative error 8e-4, max 1.7e-3 |
+| lm_head with the global scale folded into FP16 | Folded weights at most 3.375, none subnormal. Against FP32 logits: max error 0.04 on a ±70 range, top-1 agreement 100 %, mean KL 2e-5 |
+| FP16 range audit (4 prompts up to 16,219 tokens, TP2) | Before the [FP16 headroom](#fp16-headroom) fix: NaN from layer 46 on and NaN logits. After: no inf or NaN; largest value 3.9e3 (16.8x headroom); final norm 12.5, logits 87.7, `qk_bound` at most 217 |
 
 ### Quality
 
 | Probe | `TRITON_ATTN` | `FLASH_ATTN_V100` |
 | --- | --- | --- |
-| Greedy coherence | TBD | TBD |
-| Arithmetic (of 10) | TBD | TBD |
-| Coding with asserts (of 5) | TBD | TBD |
-| Needle at 32,768 tokens (3 depths) | TBD | TBD |
-| Needle at 131,072 tokens (3 depths) | TBD | TBD |
-| Needle at 250,000 tokens (3 depths) | TBD | TBD |
+| Greedy coherence | Pass; repeat identical | Pass; repeat differs (the second run hits the prefix cache) |
+| Arithmetic (of 10) | 10 | 10 |
+| Coding with asserts (of 5) | 5 | 5 |
+| Needle at 32,768 tokens (3 depths) | TBD | 3 of 3 (14.5 s each) |
+| Needle at 131,072 tokens (3 depths) | TBD | 3 of 3 (125 to 137 s each) |
+| Needle at 250,000 tokens (3 depths) | TBD | 3 of 3 (about 448 s each) |
+
+Backend agreement (`TRITON_ATTN` against `FLASH_ATTN_V100`, the same server
+profile otherwise):
+
+- Greedy chat continuations of 256 tokens match for 256, 141 and 256 tokens,
+  with at most 0.12 difference in log-probability before they diverge.
+- Teacher-forced prompt log-probabilities over 1.3K to 1.5K-token user turns
+  agree on 75 % (code) and 97 % (prose) of top-1 tokens. The differences sit
+  on low-confidence positions: inside a user turn the model often predicts a
+  comment on the pasted text instead of the next token (both backends give
+  repeated code a mean log-probability of about -3.3 to -5.5). The same text
+  outside a chat turn is copied normally (-0.02 by the sixth repeat), so this
+  is the model, not the port.
 
 ### Agent
 
 | Check | Result |
 | --- | --- |
-| Tool calls parse, no raw markup | TBD |
-| Reasoning returned and re-sent | TBD |
-| `cached_tokens` > 0 on later turns | TBD |
-| `tool_choice="none"` | TBD |
-| Streaming tool call | TBD |
+| Tool calls parse, no raw markup | Pass: 6 calls over `list_dir`, `read_file` and `run_python`; final answer correct |
+| Reasoning returned and re-sent | Pass: `message.reasoning` on 3 of 5 turns; re-sent `reasoning_content` reaches the prompt (1,105 against 1,096 tokens) |
+| `cached_tokens` > 0 on later turns | Pass: 1,088/1,105, 1,120/1,181, 1,200/1,274, 1,344/1,369 |
+| `tool_choice="none"` | Fail in the check, by the model: the server drops the tools and returns no `tool_calls`, but with a system prompt that says to use tools the model invents tools (`bash`, `shell_command`) in raw `<tool_call>` markup in 2 of 3 samples. With a neutral system prompt it answers in text. A client can forbid the markup with `logit_bias` `{"150010": -100}` (`<tool_call>`) |
+| Streaming tool call | Pass |
 
 ### Single-request latency
 
 TTFT in ms and decode in tok/s, medians of three requests after one cold
 request. Prompts are random and 256 output tokens are generated with
-`--ignore-eos`.
+`--ignore-eos`, with the server's default sampling. Only the 4K baseline
+was run here; the configuration matrix and longer inputs are TBD.
 
 | Configuration | TTFT 4K | Decode 4K | TTFT 32K | Decode 32K | TTFT 128K | Decode 128K |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| tp2-flash-skinny | TBD | TBD | TBD | TBD | TBD | TBD |
+| tp2-flash-skinny | 1,069 | 55.5 | TBD | TBD | TBD | TBD |
 | tp2-triton-skinny | TBD | TBD | TBD | TBD | TBD | TBD |
 | tp2-flash-turbomind | TBD | TBD | TBD | TBD | TBD | TBD |
 | pp2-flash-skinny | TBD | TBD | TBD | TBD | TBD | TBD |
+
+The needle runs give the long-prompt TTFT of `tp2-flash-skinny` without
+prefix-cache hits and with no other load: about 14.5 s at 32K, 125 to 137 s
+at 128K and 448 s at 250K.
 
 ### Memory
 
 | Measurement | TP2 | PP2 |
 | --- | --- | --- |
-| Weights per GPU after load | TBD | TBD |
-| Memory per GPU after graph capture | TBD | TBD |
-| `GPU KV cache size` (tokens) | TBD | TBD |
-| Maximum concurrency at 262,144 tokens | TBD | TBD |
+| Weights per GPU after load | 11.02 GiB | TBD |
+| Memory per GPU after graph capture | 29.6 GiB in `nvidia-smi` at utilization 0.90 | TBD |
+| `GPU KV cache size` (tokens) | 1,067,772 (`TRITON_ATTN`: 1,043,750) | TBD |
+| Maximum concurrency at 262,144 tokens | 4.07x | TBD |
 
 ## Known limits
 
@@ -347,8 +426,19 @@ request. Prompts are random and 256 output tokens are generated with
 - KV cache is FP16 only. FP8 KV is out of scope on this path, because E4M3
   does not compile in Triton on SM70.
 - No BF16 anywhere. Activations that leave the FP16 range overflow instead of
-  rounding, and the FP16 audit is the gate for that. If it flags a layer, keep
-  that layer's residual in FP32 before serving.
+  rounding, and the FP16 audit is the gate for that. The model's
+  [FP16 headroom](#fp16-headroom) rescaling covers the layer-46 massive
+  activations measured on the audit prompts (16.8x headroom left). Rerun the
+  audit with representative prompts after any checkpoint change.
+- Long prompts are slow to prefill on Volta: about 1,000 tokens/s at 128K and
+  560 tokens/s at 250K on the sink route.
+- `tool_choice="none"` drops the tools from the prompt and never returns
+  `tool_calls`, but the model can still write raw `<tool_call>` markup into
+  `content` when the system prompt tells it to use tools. Clients that need
+  plain text can send `logit_bias` `{"150010": -100}`.
+- With prefix caching, a repeated greedy request may take a different prefill
+  route than the first one and diverge after some tokens. `TRITON_ATTN`
+  repeated identically in the probes.
 - The TurboMind MoE route admits only the exact `(2048, 512, 256, 6)`
   contract at TP 1, 2 or 4. The skinny route rejects expert parallelism, LoRA
   and expert bias.
