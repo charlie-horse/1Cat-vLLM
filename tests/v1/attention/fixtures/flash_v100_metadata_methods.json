@@ -7,18 +7,22 @@
     "_ensure_smallq_decode_buffers": "75c1bc7d1f99aec92c560a75128629a6cf8643b2e456f38f0248197d88479fc5",
     "_clear_smallq_decode_metadata": "5ce3fbb1465067b61705c71b442ebab82381bfe19331b1845697a0cd8de50f50",
     "_attach_prepared_dflash2_smallq_metadata": "eeb866379509a02be2d450579cfc93b72b711c46324ee43aeb9a2fc00783ec04",
-    "_update_smallq_decode_metadata": "f28a21a49f91ef5075df18ae1b796815eb4e74a7864637e00a09334db2a3beb0",
+    "_update_smallq_decode_metadata": "c8738d16e07382df459f8ba0871f60438274027ef2c6faf89828bf3c05814925",
     "_attach_ddtree_metadata": "87e115a43603371223bc749e5e7bb57e19e579f85a59193652dd6db636634934",
     "_debug_draft_metadata": "765d842b3ef16546cf11dfae26481b2e58fedcc178e5b7f7bfa7501fd9e9651c",
-    "_ensure_flash_draft_graph_buffers": "fb693893f80acf16b09421711ee16f7cb89c8f626ac3b53ccfdd164fd32c1f6a",
-    "_stabilize_draft_graph_metadata": "c2372de0281cd9afb0f8c70195669b30608b4d97b68717af695142ac36ccab23",
-    "copy_dflash_graph_metadata": "47bc40edbd28836c9b30c8ae9d4cd0584fa052dd112bd31bb54db9d5d7678689",
+    "_ensure_flash_draft_graph_buffers": "7a898d3fe37f25839920c507952aeabc47d337c431c6c1a65794a847ff827f3c",
+    "_stabilize_draft_graph_metadata": "c9c0f24181e2c1019bf5b97ccdba6c899870e4018e821599d38f7fa0f0cb7dc1",
+    "copy_dflash_graph_metadata": "725bc572b04efb062982ce77da02bdfd51b42ba88cac92e8db932fbd3254584b",
     "build_for_drafting": "60899fcaf446aca846a3c47021429d72e8bb5fff369f7966bb0866640e43cdc7",
     "build": "cf6ed8f1cd8fd8c379f7101e115bdce95c47ae0abd16742400f4f478a61e247d"
   },
   "policy_migrations": {
     "_configured_smallq_max_query_len": "C: attention_config.flash_v100.smallq_max_q; borrows the builder vllm_config policy (no per-step standalone resolve)",
     "_configured_smallq_max_model_len": "D4: attention_config.flash_v100.options.smallq_decode_max_model_len",
-    "behavior_test": "tests/config/test_flash_v100_lifecycle.py::test_smallq_metadata_uses_initialized_policy_after_environment_change"
+    "behavior_test": "tests/config/test_flash_v100_lifecycle.py::test_smallq_metadata_uses_initialized_policy_after_environment_change",
+    "_update_smallq_decode_metadata": "host path: q<=1 clears and returns before the profiling flag and policy reads (same result as the original q<=1 guard)",
+    "_stabilize_draft_graph_metadata": "host path: persistent [:num_reqs] views come from DraftBuffers.views(), cached per request count; same storage and values",
+    "copy_dflash_graph_metadata": "host path: DraftBuffers.copy_metadata refreshes the three buffers with one torch._foreach_copy_",
+    "_ensure_flash_draft_graph_buffers": "host path: DraftBuffers.ensure clears the view cache when it allocates"
   }
 }

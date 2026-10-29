@@ -222,8 +222,8 @@ documented for the CPU backend, or use `nobind` to disable this behavior.
 
 For the current CPU backend setup and tuning guidance, see:
 
-- [Related runtime environment variables](../getting_started/installation/cpu.md#related-runtime-environment-variables)
-- [How to decide `VLLM_CPU_OMP_THREADS_BIND`](../getting_started/installation/cpu.md#how-to-decide-vllm_cpu_omp_threads_bind)
+- [Related runtime environment variables](https://docs.vllm.ai/en/latest/getting_started/installation/cpu/#related-runtime-environment-variables)
+- [How to decide `VLLM_CPU_OMP_THREADS_BIND`](https://docs.vllm.ai/en/latest/getting_started/installation/cpu/#how-to-decide-vllm_cpu_omp_threads_bind)
 
 The GPU-only `--numa-bind`, `--numa-bind-nodes`, and `--numa-bind-cpus` options
 do not configure CPU worker affinity.

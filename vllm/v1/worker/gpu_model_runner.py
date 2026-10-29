@@ -5419,6 +5419,8 @@ class GPUModelRunner(
             tuple[KVCacheSpec, type[AttentionMetadataBuilder]], AttentionMetadata
         ] = {}
         ddtree_fast_build_epoch: int | None = None
+        # Read once per call, not once per KV-cache group.
+        metadata_profile = _dflash_ddtree_metadata_profile_enabled()
         if ddtree_parent_metadata is not None:
             ddtree_fast_build_epoch = getattr(self, "_ddtree_fast_build_epoch", 0) + 1
             self._ddtree_fast_build_epoch = ddtree_fast_build_epoch
@@ -5499,7 +5501,6 @@ class GPUModelRunner(
                     ),
                 )
 
-            metadata_profile = _dflash_ddtree_metadata_profile_enabled()
             metadata_profile_t0 = time.perf_counter() if metadata_profile else 0.0
             metadata_profile_stage = "build"
             metadata_profile_cached = False

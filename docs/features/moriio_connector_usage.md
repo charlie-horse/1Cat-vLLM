@@ -14,7 +14,7 @@
 pip install amd_mori
 ```
 
-Refer to the [Dockerfile.rocm_base](../../docker/Dockerfile.rocm_base) for more information, or [official MoRI repository](https://github.com/rocm/mori) for instructions on how to build MoRI from source.
+Refer to the [Dockerfile.rocm_base](https://github.com/vllm-project/vllm/blob/main/docker/Dockerfile.rocm_base) for more information, or [official MoRI repository](https://github.com/rocm/mori) for instructions on how to build MoRI from source.
 
 For instructions on installing appropriate NIC userspace libraries, see [Installing NIC userspace libraries](#appendix-installing-nic-userspace-libraries).
 
@@ -256,7 +256,7 @@ The official image `vllm/vllm-openai-rocm:nightly` comes pre-installed with user
 - AINIC (AMD Pensando Pollara): version `1.117.3-hydra`, tested with `ioinic-dkms=25.11.1.001`
 - Thor2 (Broadcom): version `235.2.86.0`, tested with `bnxt-en-dkms=1.10.3.235.2.86.0`, `bnxt-re-dkms=235.2.86.0`
 
-Refer to [Dockerfile.rocm](../../docker/Dockerfile.rocm) for more details. For users with NICs, kernel modules, and/or FW other than those stated above we refer to
+Refer to [Dockerfile.rocm](https://github.com/vllm-project/vllm/blob/main/docker/Dockerfile.rocm) for more details. For users with NICs, kernel modules, and/or FW other than those stated above we refer to
 the vendors' own installation instructions.
 
 ## Further reading

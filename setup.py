@@ -110,6 +110,15 @@ elif sys.platform.startswith("linux") and os.getenv("VLLM_TARGET_DEVICE") is Non
     else:
         VLLM_TARGET_DEVICE = "cpu"
 
+# This fork builds for CUDA (SM70/V100) only. "empty" keeps the
+# no-extension path for unsupported host platforms.
+if VLLM_TARGET_DEVICE not in ("cuda", "empty"):
+    raise RuntimeError(
+        f"VLLM_TARGET_DEVICE={VLLM_TARGET_DEVICE!r} is not supported: this "
+        "fork builds for CUDA (SM70/V100) only. Install a CUDA build of "
+        "PyTorch and set VLLM_TARGET_DEVICE=cuda."
+    )
+
 
 def is_sccache_available() -> bool:
     return which("sccache") is not None and not bool(
@@ -1307,16 +1316,10 @@ def get_requirements() -> list[str]:
                 req = req.replace("humming-kernels[cu13]", "humming-kernels[cu12]")
             modified_requirements.append(req)
         requirements = modified_requirements
-    elif _is_hip():
-        requirements = _read_requirements("rocm.txt")
-    elif _is_tpu():
-        requirements = _read_requirements("tpu.txt")
-    elif _is_cpu():
-        requirements = _read_requirements("cpu.txt")
-    elif _is_xpu():
-        requirements = _read_requirements("xpu.txt")
     else:
-        raise ValueError("Unsupported platform, please use CUDA, ROCm, or CPU.")
+        raise ValueError(
+            "Unsupported platform: this fork builds for CUDA (SM70/V100) only."
+        )
     return requirements
 
 
