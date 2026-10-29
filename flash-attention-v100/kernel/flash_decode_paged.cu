@@ -3580,6 +3580,19 @@ __device__ __forceinline__ void load_half4_as_float(const __half* ptr,
   out[3] = hi.y;
 }
 
+__device__ __forceinline__ void load_half8_as_float(const __half* ptr,
+                                                    float (&out)[8]) {
+  const uint4 raw = *reinterpret_cast<const uint4*>(ptr);
+  const uint32_t words[4] = {raw.x, raw.y, raw.z, raw.w};
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const float2 f =
+        __half22float2(*reinterpret_cast<const __half2*>(&words[j]));
+    out[2 * j] = f.x;
+    out[2 * j + 1] = f.y;
+  }
+}
+
 // Grouped-query paged decode partition for head_dim 128, fp16 KV and eight
 // query heads per KV head. One CTA covers the whole query group of one KV
 // head, so each K/V row is read once per group instead of once per query
@@ -3679,61 +3692,72 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
     block_offset_shared[i] = token_idx - logical_block * block_size;
   }
 
-  // The group's queries, four dims a lane, in fp32 registers.
-  float q_reg[G][4];
+  // Each half-warp owns one token at a time; its 16 lanes hold eight dims
+  // each of the key row and of the group's eight queries (fp32 registers).
+  const int pair_half = lane >> 4;
+  const int half_lane = lane & 15;
+  const int dim8 = 8 * half_lane;
+  float q_reg[G][8];
 #pragma unroll
   for (int g = 0; g < G; ++g) {
-    load_half4_as_float(
+    load_half8_as_float(
         q + static_cast<int64_t>(batch_idx) * q_stride0 +
-            static_cast<int64_t>(kv_head_idx * G + g) * q_stride1 + dim,
+            static_cast<int64_t>(kv_head_idx * G + g) * q_stride1 + dim8,
         q_reg[g]);
   }
   __syncthreads();
 
-  const bool upper16 = (lane & 16) != 0;
-  const bool upper8 = (lane & 8) != 0;
-  const bool upper4 = (lane & 4) != 0;
-  const int score_head = (lane >> 2) & (G - 1);
+  const bool upper8 = (half_lane & 8) != 0;
+  const bool upper4 = (half_lane & 4) != 0;
+  const bool upper2 = (half_lane & 2) != 0;
+  const int score_head = (half_lane >> 1) & (G - 1);
   const int64_t k_head_base = static_cast<int64_t>(kv_head_idx) * k_head_stride;
+  // Token pairs keep both halves in the loop together for the shuffles.
 #pragma unroll 2
-  for (int t = warp; t < part_tokens; t += kWarpsPerBlock) {
-    float k[4];
-    load_half4_as_float(
-        k_cache + static_cast<int64_t>(block_idx_shared[t]) * k_block_stride +
-            static_cast<int64_t>(block_offset_shared[t]) * k_token_stride +
-            k_head_base + dim,
-        k);
+  for (int pair = warp; 2 * pair < part_tokens; pair += kWarpsPerBlock) {
+    const int t = 2 * pair + pair_half;
+    const bool valid = t < part_tokens;
+    float k[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    if (valid) {
+      load_half8_as_float(
+          k_cache + static_cast<int64_t>(block_idx_shared[t]) * k_block_stride +
+              static_cast<int64_t>(block_offset_shared[t]) * k_token_stride +
+              k_head_base + dim8,
+          k);
+    }
     float partial[G];
 #pragma unroll
     for (int g = 0; g < G; ++g) {
       float acc = q_reg[g][0] * k[0];
-      acc = fmaf(q_reg[g][1], k[1], acc);
-      acc = fmaf(q_reg[g][2], k[2], acc);
-      partial[g] = fmaf(q_reg[g][3], k[3], acc);
+#pragma unroll
+      for (int j = 1; j < 8; ++j) {
+        acc = fmaf(q_reg[g][j], k[j], acc);
+      }
+      partial[g] = acc;
     }
-    // Reduce-scatter over lane bits 4, 3 and 2: each round keeps half of
-    // the heads and adds the partner's partial sums for them.
+    // Reduce-scatter over half-lane bits 3, 2 and 1: each round keeps half
+    // of the heads and adds the partner's partial sums for them; bit 0
+    // completes the sum.
     float half_sums[4];
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
-      const float send = upper16 ? partial[j] : partial[j + 4];
-      const float keep = upper16 ? partial[j + 4] : partial[j];
-      half_sums[j] = keep + __shfl_xor_sync(0xffffffff, send, 16);
+      const float send = upper8 ? partial[j] : partial[j + 4];
+      const float keep = upper8 ? partial[j + 4] : partial[j];
+      half_sums[j] = keep + __shfl_xor_sync(0xffffffff, send, 8);
     }
     float quarter_sums[2];
 #pragma unroll
     for (int j = 0; j < 2; ++j) {
-      const float send = upper8 ? half_sums[j] : half_sums[j + 2];
-      const float keep = upper8 ? half_sums[j + 2] : half_sums[j];
-      quarter_sums[j] = keep + __shfl_xor_sync(0xffffffff, send, 8);
+      const float send = upper4 ? half_sums[j] : half_sums[j + 2];
+      const float keep = upper4 ? half_sums[j + 2] : half_sums[j];
+      quarter_sums[j] = keep + __shfl_xor_sync(0xffffffff, send, 4);
     }
     float score =
-        (upper4 ? quarter_sums[1] : quarter_sums[0]) +
-        __shfl_xor_sync(0xffffffff, upper4 ? quarter_sums[0] : quarter_sums[1],
-                        4);
-    score += __shfl_xor_sync(0xffffffff, score, 2);
+        (upper2 ? quarter_sums[1] : quarter_sums[0]) +
+        __shfl_xor_sync(0xffffffff, upper2 ? quarter_sums[0] : quarter_sums[1],
+                        2);
     score += __shfl_xor_sync(0xffffffff, score, 1);
-    if ((lane & 3) == 0) {
+    if (valid && (half_lane & 1) == 0) {
       scores_shared[score_head][t] = score * softmax_scale;
     }
   }
@@ -3755,43 +3779,161 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
   const float inv_part_sum = part_sum > 0.f ? 1.f / part_sum : 0.f;
   __syncwarp();
 
-  float acc[4] = {0.f, 0.f, 0.f, 0.f};
+  // Half-warp h accumulates tokens h, h + 2, ...; eight dims a lane.
+  float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
   const int64_t v_head_base = static_cast<int64_t>(kv_head_idx) * v_head_stride;
-#pragma unroll 8
-  for (int t = 0; t < part_tokens; ++t) {
-    float v[4];
-    load_half4_as_float(
+#pragma unroll 4
+  for (int t = pair_half; t < part_tokens; t += 2) {
+    float v[8];
+    load_half8_as_float(
         v_cache + static_cast<int64_t>(block_idx_shared[t]) * v_block_stride +
             static_cast<int64_t>(block_offset_shared[t]) * v_token_stride +
-            v_head_base + dim,
+            v_head_base + dim8,
         v);
     const float p = head_scores[t];
 #pragma unroll
-    for (int j = 0; j < 4; ++j) {
+    for (int j = 0; j < 8; ++j) {
       acc[j] = fmaf(p, v[j], acc[j]);
     }
   }
-  const __half2 lo =
-      __floats2half2_rn(acc[0] * inv_part_sum, acc[1] * inv_part_sum);
-  const __half2 hi =
-      __floats2half2_rn(acc[2] * inv_part_sum, acc[3] * inv_part_sum);
-  uint2 packed;
-  packed.x = *reinterpret_cast<const uint32_t*>(&lo);
-  packed.y = *reinterpret_cast<const uint32_t*>(&hi);
-  *reinterpret_cast<uint2*>(tmp_out + tmp_out_base + dim) = packed;
+#pragma unroll
+  for (int j = 0; j < 8; ++j) {
+    acc[j] += __shfl_xor_sync(0xffffffff, acc[j], 16);
+  }
+  if (pair_half == 0) {
+    uint4 packed;
+    uint32_t* words = reinterpret_cast<uint32_t*>(&packed);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const __half2 h2 = __floats2half2_rn(acc[2 * j] * inv_part_sum,
+                                           acc[2 * j + 1] * inv_part_sum);
+      words[j] = *reinterpret_cast<const uint32_t*>(&h2);
+    }
+    *reinterpret_cast<uint4*>(tmp_out + tmp_out_base + dim8) = packed;
+  }
   if (lane == 0) {
     max_logits[stats_index] = part_max;
     exp_sums[stats_index] = part_sum;
   }
 }
 
-// The grouped kernel loads q, K, V and the partials as aligned half4 vectors.
+// Cross-partition reducer for the grouped D128 decode. Same math as
+// flash_attention_decode_reduce_kernel (sink folded into the reference max,
+// exp(sink) added to the denominator), but it starts at the first partition
+// that overlaps the sliding window, since earlier ones carry no weight, and
+// the eight warps split the partitions instead of one thread per dim walking
+// all of them. One CTA per (sequence, query head).
+template <int PARTITION_SIZE>
+__global__ void __launch_bounds__(kThreadsPerBlock)
+    flash_attention_decode_gqa8_d128_reduce_kernel(
+        const __half* __restrict__ tmp_out,
+        const float* __restrict__ max_logits,
+        const float* __restrict__ exp_sums, const int* __restrict__ seq_lens,
+        __half* __restrict__ out, const int batch_size,
+        const int max_num_partitions, const int num_heads_q,
+        const int64_t tmp_out_stride0, const int64_t tmp_out_stride1,
+        const int64_t tmp_out_stride2, const int64_t stats_stride0,
+        const int64_t stats_stride1, const int64_t out_stride0,
+        const int64_t out_stride1, const int window_size_left,
+        const float* __restrict__ sinks) {
+  constexpr int D = kGqaDecodeHeadDim;
+  const int batch_idx = blockIdx.x;
+  const int head_idx = blockIdx.y;
+  if (batch_idx >= batch_size || head_idx >= num_heads_q) {
+    return;
+  }
+  const int lane = threadIdx.x % kWarpSize;
+  const int warp = threadIdx.x / kWarpSize;
+  const int dim = 4 * lane;
+  const int64_t out_base = static_cast<int64_t>(batch_idx) * out_stride0 +
+                           static_cast<int64_t>(head_idx) * out_stride1;
+  const int seq_len = seq_lens[batch_idx];
+  const int num_partitions =
+      min(max_num_partitions, (seq_len + PARTITION_SIZE - 1) / PARTITION_SIZE);
+  if (seq_len <= 0 || num_partitions <= 0) {
+    for (int d = threadIdx.x; d < D; d += blockDim.x) {
+      out[out_base + d] = __float2half(0.f);
+    }
+    return;
+  }
+  const int first_partition =
+      window_size_left >= 0
+          ? min(num_partitions - 1,
+                max(0, seq_len - 1 - window_size_left) / PARTITION_SIZE)
+          : 0;
+  const int count = num_partitions - first_partition;
+
+  extern __shared__ float shared_mem[];
+  float* max_shared = shared_mem;
+  float* weight_shared = shared_mem + max_num_partitions;
+  __shared__ float partial_out[kWarpsPerBlock][D];
+
+  const int64_t stats_base = static_cast<int64_t>(batch_idx) * stats_stride0 +
+                             static_cast<int64_t>(head_idx) * stats_stride1 +
+                             first_partition;
+  float local_max = -1.0e20f;
+  for (int i = threadIdx.x; i < count; i += blockDim.x) {
+    const float m = max_logits[stats_base + i];
+    max_shared[i] = m;
+    local_max = fmaxf(local_max, m);
+  }
+  const float block_max = block_reduce_max<kWarpsPerBlock>(local_max);
+  const float sink = sinks != nullptr ? sinks[head_idx] : 0.f;
+  const float global_max =
+      sinks != nullptr ? fmaxf(block_max, sink) : block_max;
+
+  float local_sum = 0.f;
+  for (int i = threadIdx.x; i < count; i += blockDim.x) {
+    const float weight =
+        exp_sums[stats_base + i] * __expf(max_shared[i] - global_max);
+    weight_shared[i] = weight;
+    local_sum += weight;
+  }
+  float global_sum = block_reduce_sum<kWarpsPerBlock>(local_sum);
+  if (sinks != nullptr) {
+    global_sum += __expf(sink - global_max);
+  }
+  const float inv_global_sum = global_sum > 0.f ? 1.f / global_sum : 0.f;
+  __syncthreads();
+
+  const __half* tmp_base =
+      tmp_out + static_cast<int64_t>(batch_idx) * tmp_out_stride0 +
+      static_cast<int64_t>(head_idx) * tmp_out_stride1 +
+      static_cast<int64_t>(first_partition) * tmp_out_stride2 + dim;
+  float acc[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll 4
+  for (int i = warp; i < count; i += kWarpsPerBlock) {
+    float v[4];
+    load_half4_as_float(tmp_base + static_cast<int64_t>(i) * tmp_out_stride2,
+                        v);
+    const float w = weight_shared[i];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      acc[j] = fmaf(w, v[j], acc[j]);
+    }
+  }
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    partial_out[warp][dim + j] = acc[j];
+  }
+  __syncthreads();
+  for (int d = threadIdx.x; d < D; d += blockDim.x) {
+    float total = 0.f;
+#pragma unroll
+    for (int w = 0; w < kWarpsPerBlock; ++w) {
+      total += partial_out[w][d];
+    }
+    out[out_base + d] = __float2half(total * inv_global_sum);
+  }
+}
+
+// The grouped kernel loads q, K, V and the partials as aligned half8 vectors.
 inline bool gqa8_d128_decode_aligned(const at::Tensor& t) {
-  if (reinterpret_cast<uintptr_t>(t.data_ptr()) % 8 != 0) {
+  if (reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 != 0) {
     return false;
   }
   for (int64_t i = 0; i + 1 < t.dim(); ++i) {
-    if (t.stride(i) % 4 != 0) {
+    if (t.stride(i) % 8 != 0) {
       return false;
     }
   }
@@ -3872,9 +4014,11 @@ void launch_flash_attention_decode_paged(
             window_size_right, route_seq_len_begin, route_seq_len_end,
             route_seq_len_final, anchor_lens, anchored_window);
   };
+  bool grouped = false;
   if constexpr (KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP16) {
     if (gqa8_d128_decode_eligible<D, PARTITION_SIZE, SEQ_LEN_ROUTE, PARTIAL_T>(
             q, k_cache, v_cache, tmp_out, use_anchored, sinks)) {
+      grouped = true;
       const dim3 group_grid(batch_size, num_heads_kv, max_num_partitions);
       flash_attention_decode_gqa8_d128_partition_kernel<PARTITION_SIZE>
           <<<group_grid, block, 0, stream>>>(
@@ -3917,6 +4061,20 @@ void launch_flash_attention_decode_paged(
   }
 
   if (!launch_reduce) {
+    return;
+  }
+
+  if (grouped) {
+    flash_attention_decode_gqa8_d128_reduce_kernel<PARTITION_SIZE>
+        <<<reduce_grid, block, reduce_shared_mem, stream>>>(
+            reinterpret_cast<const __half*>(tmp_out.data_ptr()),
+            max_logits.data_ptr<float>(), exp_sums.data_ptr<float>(),
+            seq_lens.data_ptr<int>(),
+            reinterpret_cast<__half*>(out.data_ptr<at::Half>()), batch_size,
+            max_num_partitions, num_heads_q, tmp_out.stride(0),
+            tmp_out.stride(1), tmp_out.stride(2), max_logits.stride(0),
+            max_logits.stride(1), out.stride(0), out.stride(1),
+            window_size_left, sinks);
     return;
   }
 
