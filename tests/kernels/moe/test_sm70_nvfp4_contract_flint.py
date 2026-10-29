@@ -715,17 +715,18 @@ def test_decode_persistent_explicit_request_fails_closed_without_op():
         _prepare_persistent(layer, fused=False, explicit=("flint_persistent_decode",))
 
 
-def test_decode_persistent_kill_switch_env(monkeypatch):
+def test_decode_persistent_switch_env_is_opt_in(monkeypatch):
     from vllm.config.sm70_moe import Sm70NvFp4MoEConfig
 
+    # Off by default: the single launch measured no gain over two launches.
     monkeypatch.delenv("VLLM_SM70_FLINT_MOE_PERSISTENT", raising=False)
     default = Sm70NvFp4MoEConfig()
     default.resolve()
-    assert default.flint_persistent_decode is True
-    monkeypatch.setenv("VLLM_SM70_FLINT_MOE_PERSISTENT", "0")
-    disabled = Sm70NvFp4MoEConfig()
-    disabled.resolve()
-    assert disabled.flint_persistent_decode is False
+    assert default.flint_persistent_decode is False
+    monkeypatch.setenv("VLLM_SM70_FLINT_MOE_PERSISTENT", "1")
+    enabled = Sm70NvFp4MoEConfig()
+    enabled.resolve()
+    assert enabled.flint_persistent_decode is True
 
 
 @pytest.mark.parametrize("tokens", (1, 2))
@@ -1312,10 +1313,10 @@ def _decode_apply(method, layer, x, weights, ids, *, persistent: bool):
 
 def _persistent_layer(raw, monkeypatch):
     monkeypatch.delenv("VLLM_SM70_FLINT_MOE_QPN_DECODE", raising=False)
-    monkeypatch.delenv("VLLM_SM70_FLINT_MOE_PERSISTENT", raising=False)
+    monkeypatch.setenv("VLLM_SM70_FLINT_MOE_PERSISTENT", "1")  # opt-in path
     method, layer = _prepared_flint_layer(raw)
     assert layer.sm70_nvfp4_decode_qpn
-    assert layer.sm70_nvfp4_decode_persistent, "default must admit one launch"
+    assert layer.sm70_nvfp4_decode_persistent, "=1 must admit one launch"
     return method, layer
 
 
@@ -1402,9 +1403,10 @@ def test_flint_decode_persistent_cuda_graph_replay(monkeypatch):
 
 
 @requires_sm70
-def test_flint_decode_persistent_kill_switch_keeps_two_kernels(monkeypatch):
+def test_flint_decode_default_keeps_two_kernels(monkeypatch):
     _requires_fused_decode_op()
-    monkeypatch.setenv("VLLM_SM70_FLINT_MOE_PERSISTENT", "0")
+    monkeypatch.delenv("VLLM_SM70_FLINT_MOE_QPN_DECODE", raising=False)
+    monkeypatch.delenv("VLLM_SM70_FLINT_MOE_PERSISTENT", raising=False)
     generator = torch.Generator().manual_seed(4)
     raw = _flint_expert_weights(256, generator)
     with set_current_vllm_config(_vllm_config("cuda")):

@@ -585,7 +585,7 @@ class Sm70NvFp4MoEConfig(Sm70MoELegacyConfig):
     flint_qpn_decode: bool | None = None
     """Initialization override for VLLM_SM70_FLINT_MOE_QPN_DECODE."""
     flint_persistent_decode: bool | None = None
-    """Initialization override for VLLM_SM70_FLINT_MOE_PERSISTENT."""
+    """Initialization override for VLLM_SM70_FLINT_MOE_PERSISTENT (default off)."""
     route_debug: bool | None = None
     """Historical Qwen route diagnostic, excluded from the calculation hash."""
 
