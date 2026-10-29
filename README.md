@@ -6,7 +6,7 @@ A personal fork of [1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM), the
 two Tesla V100-PCIe-32GB cards behind a PCIe switch, no NVLink, serving one
 model at a time with tensor parallelism 2.
 
-### What's different
+## What's different
 
 - Optimized for Qwen3.6 35B A3B + DFlash2
 - Support for Recursive's Flint added + optimized
