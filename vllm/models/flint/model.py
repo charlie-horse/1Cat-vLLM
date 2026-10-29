@@ -437,10 +437,14 @@ class FlintForCausalLM(nn.Module, SupportsPP):
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
         if get_pp_group().is_last_rank:
+            # Flint checkpoints store lm_head unquantized (the ModelOpt config
+            # excludes it), so it takes the plain embedding method. With the
+            # quant config, ModelOpt would hand this ParallelLMHead an
+            # UnquantizedLinearMethod, whose SM70 dense preparation needs
+            # LinearBase state that an embedding layer does not have.
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
                 config.hidden_size,
-                quant_config=self.quant_config,
                 prefix=maybe_prefix(prefix, "lm_head"),
             )
             if config.tie_word_embeddings:

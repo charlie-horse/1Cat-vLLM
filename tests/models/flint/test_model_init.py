@@ -463,6 +463,9 @@ def test_load_nvfp4_checkpoint(dist, cpu_layers, nvfp4_moe_stub):
         ModelOptNvFp4FusedMoE,
         ModelOptNvFp4W4A16LinearMethod,
     )
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        UnquantizedEmbeddingMethod,
+    )
 
     cfg = tiny_config()
     model, _ = build(cfg, quant_config=nvfp4_config())
@@ -480,7 +483,8 @@ def test_load_nvfp4_checkpoint(dist, cpu_layers, nvfp4_moe_stub):
         ModelOptNvFp4W4A16LinearMethod,
     )
     assert isinstance(layer.mlp.gate.quant_method, UnquantizedLinearMethod)
-    assert isinstance(model.lm_head.quant_method, UnquantizedLinearMethod)
+    # The unquantized lm_head never takes the quant config.
+    assert isinstance(model.lm_head.quant_method, UnquantizedEmbeddingMethod)
     assert model.lm_head.weight.dtype == torch.float16
     assert model.model.embed_tokens.weight.dtype == torch.float16
 
