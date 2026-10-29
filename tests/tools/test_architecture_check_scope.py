@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Keep local/CI filters covering the offline reader without widening scope."""
-
-from fnmatch import fnmatchcase
+"""Keep local hook filters covering the offline reader without widening scope."""
 
 import regex as re
 import yaml
@@ -12,20 +10,13 @@ from tools import generate_architecture_reference as reference
 HOOKS = {"check-architecture-reference", "test-architecture-reference"}
 
 
-def test_local_and_ci_filters_cover_inputs_and_skip_unrelated_files():
+def test_local_filters_cover_inputs_and_skip_unrelated_files():
     root = reference.ROOT
     hooks = yaml.safe_load((root / ".pre-commit-config.yaml").read_text())
     selected = [
         hook for repo in hooks["repos"] for hook in repo["hooks"] if hook["id"] in HOOKS
     ]
     assert {hook["id"] for hook in selected} == HOOKS
-    workflow = yaml.load(
-        (root / ".github/workflows/architecture-docs.yml").read_text(),
-        Loader=yaml.BaseLoader,
-    )
-    events = workflow["on"]
-    assert events["push"]["paths"] == events["pull_request"]["paths"]
-    paths = events["pull_request"]["paths"]
     related = [
         *reference.MAINTAINED_DOCS,
         reference.CODECS,
@@ -42,8 +33,6 @@ def test_local_and_ci_filters_cover_inputs_and_skip_unrelated_files():
         "tests/tools/test_architecture_check_scope.py",
         "docs/mkdocs/hooks/url_schemes.py",
         "docs/mkdocs/hooks/generate_argparse.py",
-        ".github/workflows/architecture-docs.yml",
-        ".github/workflows/pre-commit.yml",
         ".pre-commit-config.yaml",
         "mkdocs.yaml",
     ]
@@ -56,19 +45,6 @@ def test_local_and_ci_filters_cover_inputs_and_skip_unrelated_files():
     for name, expected in [(p, True) for p in related] + [
         (p, False) for p in unrelated
     ]:
-        assert any(fnmatchcase(name, pattern) for pattern in paths) == expected, name
         for hook in selected:
             assert not hook.get("always_run", False)
             assert bool(re.search(hook["files"], name)) == expected, name
-
-
-def test_all_files_lint_delegates_only_the_two_new_hooks():
-    workflow = yaml.safe_load(
-        (reference.ROOT / ".github/workflows/pre-commit.yml").read_text()
-    )
-    steps = workflow["jobs"]["pre-commit"]["steps"]
-    action = next(
-        step for step in steps if "pre-commit/action@" in step.get("uses", "")
-    )
-    assert set(action["env"]["SKIP"].split(",")) == HOOKS
-    assert action["with"]["extra_args"] == "--all-files --hook-stage manual"

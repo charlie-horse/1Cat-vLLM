@@ -31,8 +31,6 @@ MAINTAINED_DOCS = (
     "docs/design/architecture/sm70_phase_e.md",
     "docs/contributing/1cat-development.md",
     "docs/contributing/README.md",
-    "CONTRIBUTING.md",
-    ".github/PULL_REQUEST_TEMPLATE.md",
     "vllm/v1/attention/kv_codecs.README.md",
     "vllm/v1/attention/backends/flash_v100/README.md",
     "vllm/model_executor/layers/fused_moe/sm70/README.md",

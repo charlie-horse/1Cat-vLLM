@@ -200,19 +200,17 @@ API_AUTONAV_EXCLUDE=vllm mkdocs build
 
 The test hook runs the focused CPU suite with `--confcutdir=tests/tools`, avoiding
 inference fixtures. The check hook defaults to read-only operation. The generated
-reference, overview, three component READMEs, INT8 proposal, E record, this guide,
-two contributing entry points and PR template are the explicit link-check scope
+reference, overview, three component READMEs, INT8 proposal, E record, this guide
+and the contributing entry point are the explicit link-check scope
 in [`MAINTAINED_DOCS`](../../tools/generate_architecture_reference.py). It checks
 local targets, heading anchors and source line bounds, not historical or external
 URLs across the repository.
 
-Local hooks use matching file filters. The `architecture-docs` CI workflow uses
-matching path filters for declarations/configuration, maintained documents,
-generator/readers, documentation hooks and check wiring. The existing all-files
-lint job skips only these two new hooks because the filtered workflow owns them.
-Existing layering, ownership and deprecation gates retain their constraints.
+Both hooks use matching file filters for declarations/configuration, maintained
+documents, generator/readers, documentation hooks and check wiring. Existing
+layering, ownership and deprecation gates retain their constraints.
 
-Use the [PR template](../../.github/PULL_REQUEST_TEMPLATE.md) to report path ×
+In the PR description, report path ×
 format × key conditions, expected selection/fallback, evidence type and gaps.
 For documentation-only changes, write `N/A` with the reason; GPU tests are not
 required. For runtime changes, select the smallest affected tests, retain exact

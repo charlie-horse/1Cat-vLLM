@@ -280,8 +280,7 @@ repos:
       tools/sm70/path_inventory\.py|tools/pre_commit/environment_readers\.py|
       tests/tools/test_architecture_.*\.py|docs/mkdocs/hooks/.*\.py|
       docs/design/architecture/(README|runtime_reference|int8_g64_codec|sm70_phase_e)\.md|
-      docs/contributing/(README|1cat-development)\.md|CONTRIBUTING\.md|
-      \.github/PULL_REQUEST_TEMPLATE\.md|\.github/workflows/(architecture-docs|pre-commit)\.yml|
+      docs/contributing/(README|1cat-development)\.md|
       \.pre-commit-config\.yaml|mkdocs\.yaml)$
   - id: test-architecture-reference
     name: Test offline architecture reference and documentation checks
