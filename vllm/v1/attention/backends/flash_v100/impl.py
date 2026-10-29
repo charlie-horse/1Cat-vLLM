@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import functools
 from dataclasses import fields
 from types import SimpleNamespace
 from typing import Any, cast
@@ -44,35 +43,14 @@ from vllm.v1.attention.ops.sm70_grouped import (
 
 logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
 
-# Whether the generic decode helper threads ``sinks`` itself. Either way the
-# bound native operator (``_bind_sinks``) applies them.
-_DECODE_HELPER_TAKES_SINKS = _ops.callable_accepts_keyword(
-    _decode.DecodeExecutor._call_flash_attn_decode_paged, "sinks"
-)
-
-
-def _bind_sinks(operation, sinks: torch.Tensor):
-    """Pass a layer's learned sinks to a generic native kernel on every call.
-
-    The executors receive the native operators from this implementation, so a
-    bound operator reaches the kernel on every generic route. A caller that
-    passes ``sinks`` keeps its tensor; an explicit ``None`` does not drop them.
-    """
-
-    @functools.wraps(operation)
-    def call(*args, **kwargs):
-        if kwargs.get("sinks") is None:
-            kwargs["sinks"] = sinks
-        return operation(*args, **kwargs)
-
-    return call
-
 
 class FlashAttnV100Impl(TritonAttentionImpl):
     """Flash Attention V100 implementation with explicit fallback policy."""
 
     # Learned sinks admitted onto the generic paged kernels, else None. The
-    # rejection names why a layer with sinks was not admitted.
+    # executors receive them through DecodeConfig.sinks and
+    # PrefillConfig.sinks. The rejection names why a layer with sinks was not
+    # admitted.
     _flash_v100_sinks: torch.Tensor | None = None
     _flash_v100_sink_rejection: str | None = None
 
@@ -511,8 +489,11 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         softmax denominator (``flash_attn_v100.SUPPORTS_SINKS``); every other
         Flash-V100 kernel would silently drop it. An admitted layer therefore
         disables the other routes once, as the prefix-anchored mask does, and
-        binds its sinks to the two generic operators. A layer that is not
-        admitted keeps the explicit fallback policy of ``forward``.
+        records its sinks in ``_flash_v100_sinks``. The decode and prefill
+        executors receive them through their configs and pass them to the
+        generic kernels, and fail closed on any sink-unaware route. A layer
+        that is not admitted keeps the explicit fallback policy of
+        ``forward``.
         """
         if self.sinks is None:
             return
@@ -545,15 +526,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         self.use_flash_v100_prefill_contig_dense = False
         self.use_flash_v100_prefill_gather_dense = False
         self.use_fp8_prefill_bridge = False
-        # The no-prefix dense prefill kernel has no sink term: read the paged
-        # KV cache through the generic paged prefill kernel instead.
-        self.use_prefill_paged_cache = True
-        self.flash_attn_prefill_paged = _bind_sinks(
-            self.flash_attn_prefill_paged, self.sinks
-        )
-        self.flash_attn_decode_paged = _bind_sinks(
-            self.flash_attn_decode_paged, self.sinks
-        )
+        # No-prefix prefill needs no paged-cache read: with sinks, the prefill
+        # executor runs the raw K/V through the paged kernel itself.
         logger.info_once(
             "FLASH_ATTN_V100 applies learned attention sinks through the "
             "generic paged prefill and decode kernels (head size %d); the "
@@ -562,12 +536,6 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             self.head_size,
             scope="process",
         )
-
-    def _decode_helper_sink_kwargs(self) -> dict[str, torch.Tensor]:
-        sinks = self._flash_v100_sinks
-        if sinks is None or not _DECODE_HELPER_TAKES_SINKS:
-            return {}
-        return {"sinks": sinks}
 
     _small_tensor_list = staticmethod(_debug_compare.small_tensor_list)
 
@@ -635,6 +603,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             self.kv_cache_dtype,
             getattr(self, "attn_type", AttentionType.DECODER),
             getattr(self, "sliding_window", None),
+            sinks=self._flash_v100_sinks,
         )
         ops = _decode.DecodeOps(
             dense=getattr(self, "flash_attn_func", None),
@@ -701,7 +670,6 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             partition_size_hint=partition_size_hint,
             anchor_lens=anchor_lens,
             anchored_window=anchored_window,
-            **self._decode_helper_sink_kwargs(),
         )
 
     def _new_comparison_executor(self):
@@ -735,6 +703,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             cast(_config.V100AttnConfig, policy),
             getattr(self, "scale", 1.0),
             getattr(self, "kv_cache_dtype", "auto"),
+            sinks=self._flash_v100_sinks,
         )
         native: dict[str, Any] = {
             field: getattr(self, legacy_name, None)

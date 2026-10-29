@@ -267,7 +267,12 @@ def test_config_matches_checkpoint_fields():
 def test_registered_architecture():
     from vllm.model_executor.models.registry import _VLLM_MODELS, ModelRegistry
 
-    assert _VLLM_MODELS["FlintForCausalLM"] == ("vllm.models.flint", "FlintForCausalLM")
+    # The model module, not the lazy package __init__, so that the registry's
+    # model-info cache is keyed on the file that defines the class.
+    assert _VLLM_MODELS["FlintForCausalLM"] == (
+        "vllm.models.flint.model",
+        "FlintForCausalLM",
+    )
     model_cls = ModelRegistry._try_load_model_cls("FlintForCausalLM")
     from vllm.models.flint import FlintForCausalLM
 

@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from typing import Any
 
@@ -50,6 +50,7 @@ def _flash_v100_prefill(
     sinks: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Prefill path for no-prefix case (query_len == seq_len per sequence)."""
+    sinks = _layer_sinks(self, sinks)
     if sinks is not None:
         return _flash_v100_dense_prefill_with_sinks(
             self, query, key, value, attn_metadata, output, sinks
@@ -75,6 +76,42 @@ def _flash_v100_prefill(
         window_size=window_size,
         query_start_loc_device=attn_metadata.query_start_loc,
     )
+
+
+def _configured_sinks(self: PrefillExecutor) -> torch.Tensor | None:
+    return getattr(getattr(self, "settings", None), "sinks", None)
+
+
+def _layer_sinks(
+    self: PrefillExecutor, sinks: torch.Tensor | None
+) -> torch.Tensor | None:
+    """The layer's sinks: an explicit argument or ``PrefillConfig.sinks``.
+
+    The attention implementation configures a layer's admitted sinks on the
+    executor, as it does for decode (``DecodeConfig.sinks``), so every prefill
+    entry point applies them without a per-call keyword.
+    """
+    configured = _configured_sinks(self)
+    if sinks is None or sinks is configured:
+        return configured
+    if configured is not None:
+        raise ValueError(
+            "FLASH_ATTN_V100 prefill received attention sinks that differ "
+            "from the sinks configured for this layer"
+        )
+    return sinks
+
+
+def _with_sinks(self: PrefillExecutor, sinks: torch.Tensor) -> PrefillExecutor:
+    """This executor with ``sinks`` bound into its settings.
+
+    Instance-level compatibility overrides are kept, so every route of the
+    copy applies the sinks as an executor configured with them does.
+    """
+    rebound = object.__new__(type(self))
+    vars(rebound).update(vars(self))
+    rebound.settings = replace(self.settings, sinks=sinks)
+    return rebound
 
 
 def _sink_kwargs(sinks: torch.Tensor | None) -> dict[str, torch.Tensor]:
@@ -927,6 +964,7 @@ def _flash_v100_prefill_with_prefix(
     sinks: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Prefill path for prefix/chunked context via gathered contiguous KV."""
+    sinks = _layer_sinks(self, sinks)
     if sinks is not None:
         return _flash_v100_prefill_with_prefix_sinks(
             self, layer, query, kv_cache, attn_metadata, output, sinks
@@ -1443,6 +1481,23 @@ def forward(
     *,
     sinks: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    # Sinks reach every route through ``settings.sinks``; the implementation's
+    # call into this body is pinned without keywords by the composition tests.
+    sinks = _layer_sinks(self, sinks)
+    if sinks is not _configured_sinks(self):
+        return _with_sinks(self, sinks).forward(
+            layer,
+            query,
+            key,
+            value,
+            kv_cache,
+            attn_metadata,
+            output,
+            output_scale,
+            output_block_scale,
+            is_capturing,
+            layer_name,
+        )
     sink_kwargs = _sink_kwargs(sinks)
     available_query_tokens = min(
         int(query.shape[0]),
@@ -1541,7 +1596,6 @@ def forward(
             smallq_decode,
             metadata_live_token_mismatch,
             available_query_tokens,
-            **sink_kwargs,
         )
     if not log_once_seen("flash_v100._logged_prefill_flash"):
         logger.info_once(
@@ -1769,8 +1823,6 @@ def _forward_with_prefix(
     smallq_decode,
     metadata_live_token_mismatch,
     available_query_tokens,
-    *,
-    sinks: torch.Tensor | None = None,
 ):
     if _debug.draft_graph_debug_enabled():
         _debug.draft_graph_debug_log(
@@ -1837,7 +1889,8 @@ def _forward_with_prefix(
         kv_cache,
         attn_metadata,
         output,
-        **_sink_kwargs(sinks),
+        # The forward entry binds explicit sinks into ``settings.sinks``.
+        **_sink_kwargs(_layer_sinks(self, None)),
     )
     self.ops.compare_triton(
         layer,

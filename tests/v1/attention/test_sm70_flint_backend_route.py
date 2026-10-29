@@ -8,8 +8,10 @@ flag and the native operators are faked. The executors in ``decode.py`` and
 reach the generic native kernels through the routes that exist today.
 """
 
+import importlib
 import sys
-from types import SimpleNamespace
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -19,7 +21,6 @@ import vllm.platforms
 from vllm.model_executor.models import config as qualification
 from vllm.platforms import runtime_defaults
 from vllm.v1.attention.backend import AttentionType
-from vllm.v1.attention.backends.flash_v100 import decode as v100_decode
 from vllm.v1.attention.backends.flash_v100 import impl as v100_impl
 from vllm.v1.attention.backends.flash_v100 import ops as v100_ops
 from vllm.v1.attention.backends.flash_v100.backend import FlashAttnV100Backend
@@ -33,6 +34,7 @@ NUM_KV_HEADS = 4
 HEAD_SIZE = 128
 SLIDING_WINDOW = 513
 BLOCK_SIZE = 16
+FLASH_V100_ROOT = Path(__file__).resolve().parents[3] / "flash-attention-v100"
 
 
 def _set_native_flag(monkeypatch, supports_sinks: bool | None) -> None:
@@ -60,6 +62,64 @@ def _set_native_flag(monkeypatch, supports_sinks: bool | None) -> None:
 def test_capability_flag_reader(monkeypatch, module, expected):
     monkeypatch.setitem(sys.modules, "flash_attn_v100", module)
     assert qualification.flash_v100_supports_sinks() is expected
+
+
+def _is_flash_v100_module(name: str) -> bool:
+    return name in ("flash_attn_v100", "flash_attn_v100_cuda") or name.startswith(
+        "flash_attn_v100."
+    )
+
+
+@pytest.fixture
+def flash_v100_package(monkeypatch):
+    """Import the real ``flash_attn_v100`` package over a fake extension."""
+    before = set(sys.modules)
+    for name in list(sys.modules):
+        if _is_flash_v100_module(name):
+            monkeypatch.delitem(sys.modules, name)
+    monkeypatch.syspath_prepend(str(FLASH_V100_ROOT))
+
+    def load(entries: tuple[str, ...] | None):
+        native = None
+        if entries is not None:
+            native = ModuleType("flash_attn_v100.flash_attn_v100_cuda")
+            for entry in entries:
+                setattr(native, entry, lambda *args: None)
+        # None in sys.modules makes both extension imports raise ImportError.
+        monkeypatch.setitem(sys.modules, "flash_attn_v100.flash_attn_v100_cuda", native)
+        monkeypatch.setitem(sys.modules, "flash_attn_v100_cuda", native)
+        return importlib.import_module("flash_attn_v100")
+
+    yield load
+    for name in set(sys.modules) - before:
+        if _is_flash_v100_module(name):
+            del sys.modules[name]
+
+
+_SINK_ENTRIES = ("prefill_paged_sinks_fwd", "decode_paged_sinks_fwd")
+
+
+@pytest.mark.parametrize(
+    "entries, expected",
+    [
+        (_SINK_ENTRIES, True),
+        (_SINK_ENTRIES[:1], False),  # prefill sinks only
+        (_SINK_ENTRIES[1:], False),  # decode sinks only
+        ((), False),  # build before either sink entry
+    ],
+)
+def test_package_flag_is_computed_from_the_extension(
+    flash_v100_package, entries, expected
+):
+    package = flash_v100_package(entries)
+    assert package.SUPPORTS_SINKS is expected
+    assert qualification.flash_v100_supports_sinks() is expected
+
+
+def test_missing_extension_reports_no_sinks(flash_v100_package):
+    with pytest.raises(ImportError):
+        flash_v100_package(None)
+    assert qualification.flash_v100_supports_sinks() is False
 
 
 class _Platform:
@@ -339,7 +399,8 @@ def test_d128_generic_routes_admit_sinks(monkeypatch, native):
     assert impl.use_flash_v100_prefill_paged is True
     assert impl.use_flash_v100_decode is True
     assert impl.use_decode_scalar_paged is True
-    assert impl.use_prefill_paged_cache is True
+    # No-prefix prefill runs the raw K/V through the paged kernel itself.
+    assert impl.use_prefill_paged_cache is False
     assert impl.smallq_decode_max_query_len == 0
     for disabled in (
         "use_decode_paged_prefill",
@@ -355,12 +416,12 @@ def test_d128_generic_routes_admit_sinks(monkeypatch, native):
     ):
         assert getattr(impl, disabled) is False, disabled
 
-    # Sinks are bound to exactly the two generic native kernels.
-    assert impl.flash_attn_prefill_paged is not native["prefill"]
-    assert impl.flash_attn_decode_paged is not native["decode"]
+    # The native operators stay unwrapped: the executors' configs carry the
+    # sinks, and the executors pass them to the generic kernels.
     for name, attribute in (
         ("dense", "flash_attn_func"),
         ("bhmd", "flash_attn_bhmd_func"),
+        ("decode", "flash_attn_decode_paged"),
         ("xqa", "flash_attn_decode_paged_xqa"),
         ("wmma", "flash_attn_decode_paged_wmma"),
         ("prefill_bhmd", "flash_attn_prefill_paged_bhmd"),
@@ -368,18 +429,17 @@ def test_d128_generic_routes_admit_sinks(monkeypatch, native):
         ("splitkv", "flash_attn_prefill_paged_splitkv"),
     ):
         assert getattr(impl, attribute) is native[name], attribute
+    assert impl._new_decode_executor().config.sinks is sinks
+    assert impl._new_prefill_executor().settings.sinks is sinks
 
 
-def test_bound_operator_passes_sinks_and_keeps_signature(monkeypatch, native):
+def test_paged_operators_receive_sinks_only_from_the_executors(monkeypatch, native):
     impl = _impl(monkeypatch)
     query = torch.zeros(1, NUM_HEADS, HEAD_SIZE)
     impl.flash_attn_decode_paged(query, out=torch.empty_like(query))
-    impl.flash_attn_decode_paged(query, out=torch.empty_like(query), sinks=None)
-    other = torch.zeros(NUM_HEADS)
-    impl.flash_attn_decode_paged(query, out=torch.empty_like(query), sinks=other)
-    passed = [kwargs["sinks"] for kwargs in native.kwargs_of("decode")]
-    assert passed[0] is impl.sinks and passed[1] is impl.sinks
-    assert passed[2] is other
+    impl.flash_attn_prefill_paged(query[None])
+    assert "sinks" not in native.kwargs_of("decode")[-1]
+    assert "sinks" not in native.kwargs_of("prefill")[-1]
     assert v100_ops.callable_accepts_keyword(
         impl.flash_attn_decode_paged, "window_size"
     )
@@ -408,6 +468,8 @@ def test_other_routes_reject_sinks(monkeypatch, native, kwargs, reason):
     impl.flash_attn_prefill_paged(query)
     assert "sinks" not in native.kwargs_of("prefill")[-1]
     assert impl.use_prefill_paged_cache is False
+    assert impl._new_decode_executor().config.sinks is None
+    assert impl._new_prefill_executor().settings.sinks is None
 
 
 def test_d256_xqa_layer_rejects_sinks_with_flag(monkeypatch, native):
@@ -422,7 +484,8 @@ def test_layer_without_sinks_is_unchanged(monkeypatch, native):
     assert impl._supports_flash_v100_path() is True
     assert impl.flash_attn_decode_paged is native["decode"]
     assert impl.use_prefill_paged_cache is False
-    assert impl._decode_helper_sink_kwargs() == {}
+    assert impl._new_decode_executor().config.sinks is None
+    assert impl._new_prefill_executor().settings.sinks is None
 
 
 def test_unavailable_generic_routes_or_speculation_reject_sinks(monkeypatch, native):
@@ -500,13 +563,10 @@ def test_prefill_reaches_generic_kernel_with_sinks(
     assert kwargs["window_size"] == (SLIDING_WINDOW - 1, 0)
 
 
-def test_decode_helper_receives_sinks_once_it_accepts_them(monkeypatch, native):
+def test_decode_helper_applies_the_configured_sinks(monkeypatch, native):
+    # Prefill decode rows and the verifier reach the generic decode kernel
+    # through this helper; the decode executor's config supplies the sinks.
     impl = _impl(monkeypatch)
-    received = []
-
-    def helper(self, *args, **kwargs):
-        received.append(kwargs.get("sinks"))
-
     query = torch.zeros(1, NUM_HEADS, HEAD_SIZE)
     call = dict(
         softmax_scale=1.0,
@@ -516,16 +576,34 @@ def test_decode_helper_receives_sinks_once_it_accepts_them(monkeypatch, native):
         v_scale=1.0,
     )
     caches = (torch.zeros(1), torch.zeros(1), torch.zeros(1, 1), torch.ones(1))
-    # Without the helper keyword, the bound operator still applies the sinks.
     impl._call_flash_attn_decode_paged(query, *caches, **call)
     assert native.kwargs_of("decode")[-1]["sinks"] is impl.sinks
 
-    monkeypatch.setattr(
-        v100_decode.DecodeExecutor, "_call_flash_attn_decode_paged", helper
-    )
-    monkeypatch.setattr(v100_impl, "_DECODE_HELPER_TAKES_SINKS", True)
-    impl._call_flash_attn_decode_paged(query, *caches, **call)
-    assert received == [impl.sinks]
+    # An explicit argument may only repeat the layer's own sinks.
+    executor = impl._new_decode_executor()
+    executor._call_flash_attn_decode_paged(query, *caches, sinks=impl.sinks, **call)
+    assert native.kwargs_of("decode")[-1]["sinks"] is impl.sinks
+    with pytest.raises(ValueError, match="differ"):
+        executor._call_flash_attn_decode_paged(
+            query, *caches, sinks=torch.zeros(NUM_HEADS), **call
+        )
+    assert len(native.kwargs_of("decode")) == 2
+
+
+def test_prefill_rejects_sinks_that_differ_from_the_layer(monkeypatch, native):
+    impl = _impl(monkeypatch)
+    metadata = _metadata([12], [12])
+    query = torch.zeros(12, NUM_HEADS, HEAD_SIZE)
+    key = torch.zeros(12, NUM_KV_HEADS, HEAD_SIZE)
+    executor = impl._new_prefill_executor()
+    with pytest.raises(ValueError, match="differ"):
+        executor._flash_v100_prefill(
+            query, key, key, metadata, query.clone(), sinks=torch.zeros(NUM_HEADS)
+        )
+    output = torch.zeros_like(query)
+    executor._flash_v100_prefill(query, key, key, metadata, output, sinks=impl.sinks)
+    (kwargs,) = native.kwargs_of("prefill")
+    assert kwargs["sinks"] is impl.sinks
 
 
 def test_rejected_sink_layer_keeps_the_runtime_error(monkeypatch, native):

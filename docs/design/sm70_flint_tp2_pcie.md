@@ -54,8 +54,10 @@ The published NVFP4 GGUF is converted once, offline, into ModelOpt safetensors:
   scale. There is no `input_scale`, so the scheme is W4A16.
 - `config.json` declares `W4A16_NVFP4` with group size 16 and
   `exclude_modules = ["model.embed_tokens", "*.mlp.gate", "lm_head"]`.
-- `lm_head.weight` is stored dequantized but normalized in FP16. The scalar
-  `lm_head.weight_scale_2` is applied to the logits.
+- `lm_head.weight` is stored dequantized but normalized in FP16, with the
+  scalar `lm_head.weight_scale_2`. In FP16 the model folds the scalar into the
+  weight at load time, because the unscaled logits would overflow FP16. In
+  other dtypes it applies the scalar to the logits, as upstream does.
 - The sinks `self_attn.softmax_offset` are FP32 `[32]` per layer. The model
   shards them by query head across TP ranks.
 - No tensor is BF16. Every BF16→FP16 cast checks `|x| <= 65504`.
@@ -93,22 +95,54 @@ renders it again as `<think>…</think>`.
 
 | Route | Sinks | Prefill on SM70 | Decode on SM70 | Admission |
 | --- | --- | --- | --- | --- |
-| `TRITON_ATTN` | Native, same `sinks` semantics as gpt-oss | FP32 FMA on Volta, so long prefill is slow | Unified Triton kernel | Always available. The fallback when Flash-V100 lacks sinks |
-| `FLASH_ATTN_V100` | Contract C4: optional `sinks` on `flash_attn_prefill_paged` and `flash_attn_decode_paged`, including split-KV reducers | Tensor-core paged prefill, D128 generic route | Paged decode, D128 generic route with split-KV | Only when `flash_attn_v100.SUPPORTS_SINKS` is true. D256, XQA and the FP8 bridge still reject sinks |
+| `TRITON_ATTN` | Native, same `sinks` semantics as gpt-oss | FP32 FMA on Volta, so long prefill is slow | Unified Triton kernel | Always available. The fallback when the Flash-V100 sink route does not apply |
+| `FLASH_ATTN_V100` | Contract C4: optional `sinks` on `flash_attn_prefill_paged` and `flash_attn_decode_paged` | Tensor-core generic paged prefill for every request, D128 | Generic scalar paged decode, D128; the cross-partition reducer applies the sinks | See the selection rules below. D256, XQA, the small-query verifier, the decode bridges and the FP8 bridge have no sink term and are never used for sink layers |
 
-With no `--attention-backend` given, the model config picks `FLASH_ATTN_V100`
-when the extension reports `SUPPORTS_SINKS` and the head size takes the
-generic D128 route. Otherwise it picks `TRITON_ATTN`. The flag stays false on
-every individual branch and is set by the integration branch once both sink
-kernels are merged. `--attention-backend TRITON_ATTN|FLASH_ATTN_V100` forces
-either route for A/B runs.
+With no `--attention-backend` given and every participating CUDA device at
+SM 7.0 or 7.2, `FlintModelConfig` (`vllm/model_executor/models/config.py`)
+picks `FLASH_ATTN_V100` only when all of these hold:
+
+- Flash-V100 automatic selection is not disabled in the attention config.
+- `flash_attn_v100.SUPPORTS_SINKS` is true. The package computes it from the
+  built extension: true only when it exports both `prefill_paged_sinks_fwd`
+  and `decode_paged_sinks_fwd`. It is false for an older build, and the
+  reader reports false when the extension does not import.
+- The model dtype is float16 (`--dtype half`).
+- `head_dim` is 128, the only head size whose generic kernels take sinks.
+- The KV cache is FP16 (`--kv-cache-dtype auto`).
+- There is no speculative decoding.
+
+Otherwise it picks `TRITON_ATTN` and logs the reason. With an FP8 E4M3 KV
+cache it also warns, because Triton cannot compile E4M3 on SM70. An explicit
+`--attention-backend TRITON_ATTN|FLASH_ATTN_V100` is kept as given, for A/B
+runs. A deployment with any non-SM70 device keeps the platform's own choice.
+
+Each Flash-V100 layer then admits its sinks only if it is decoder attention
+with head size 128, an FP16 KV cache, contiguous FP32 sinks (the parameter
+itself, so loaded weights stay visible), the paged prefill and scalar paged
+decode kernels, and no speculative config. An admitted layer turns off XQA,
+the small-query verifier, the decode bridges, prefill split-KV, BFLA, the
+contiguous and gathered dense prefill and the FP8 bridge. It hands its sinks
+to the decode and prefill executors through `DecodeConfig.sinks` and
+`PrefillConfig.sinks`, which pass them to the two generic kernels:
+
+- Decode takes the scalar paged decoder.
+- Prefill runs every request on the generic paged prefill kernel. A request
+  without a prefix reads its raw K/V as one page per request, and a chunked
+  or prefix request reads the paged cache. The mixed decode-rows batch is
+  bypassed, and the prefix-anchored window and tree attention raise.
+
+A layer with sinks that is not admitted raises at its first forward, unless
+`VLLM_FLASH_V100_ALLOW_TRITON_FALLBACK=1`.
 
 The Flash-V100 sink term adds mass to the softmax denominator only and adds
-no value vector. In the kernel's log2-scaled domain, before the final
+no value vector. Both kernels keep the running maximum `m` of the scaled
+scores in natural-log units, as the sinks are. Before the final
 normalization:
 
 ```text
-row_sum += exp2(sink * log2(e) - row_max)
+prefill epilogue:   row_sum += exp(min(sink - row_max, 80))   (also in the LSE)
+decode reducer:     m = max(global_max, sink); sum += exp(sink - m)
 ```
 
 `sinks=None` keeps the previous kernels bit for bit. Full-attention layers
@@ -216,7 +250,7 @@ tools/flint/sm70_validate.sh --stage smoke,quality,agent \
 | build | `requirements/build/cuda.txt`, then `uv pip install --no-build-isolation -e .` with `TORCH_CUDA_ARCH_LIST=7.0` and `--torch-backend=cu128`, then the test requirements. `--flash-only` rebuilds just the Flash-V100 extension in place | `vllm._C`, `flash_attn_v100_cuda`, `paged_kv_utils` and `vllm.models.flint` import; sm_70 is in Torch's arch list. It reports `SUPPORTS_SINKS` and whether the `sinks=` kwargs exist |
 | convert | `python -m vllm.models.flint.convert_gguf SRC OUT --hf-config RecursiveSI/flint`, then a header-level checkpoint check | Config fields as above, 49 FP32 sinks, 36,096 expert projections, NVFP4 scale dtypes, `lm_head.weight_scale_2`, no BF16 |
 | kernels | `test_sm70_flash_v100_sinks_{prefill,decode}.py`, `test_sm70_nvfp4_contract_flint.py`, plus Flash-V100 paged-prefill determinism, split-KV, anchored SWA, any-page and varlen layout, plus the skinny MoE tests | No failures. A warning if every new test skipped |
-| audit | `tools/flint/fp16_range_audit.py --model DIR --tensor-parallel-size 2` | Exit 0: no layer above the FP16 threshold |
+| audit | `python -m tools.flint.fp16_range_audit --model DIR --tensor-parallel-size 2` from the repository root | Exit 0: no layer above the FP16 threshold |
 | smoke | Start the serve script, wait for `/health`, check `/v1/models`, one chat completion, stop | Non-empty content without raw `<think>` or `<tool_call>` markup. A warning if 17 × 23 is not 391 |
 | quality | Greedy coherence (twice), 10 inline arithmetic problems, 5 coding tasks executed against asserts, `tools/flint/needle.py` at 32,768, 131,072 and 250,000 tokens and depths 0.1/0.5/0.9 | Coherent greedy text, ≥ 8/10 arithmetic, ≥ 4/5 coding, every needle found |
 | agent | `tools/flint/agent_e2e.py`: multi-turn agent with `list_dir`, `read_file` and `run_python` in a temporary workspace | Tool calls parse, reasoning re-sent in history reaches the prompt, `cached_tokens` > 0 on every later turn, `tool_choice="none"` returns text only, streamed tool call assembles, correct final answer |
@@ -251,7 +285,7 @@ topology stage with every table.
 
 | Check | Result |
 | --- | --- |
-| Sink prefill vs torch reference (SWA 513, D128, GQA 8:1, FP16 KV, split-KV) | TBD |
+| Sink prefill vs torch reference (SWA 513, D128, GQA 8:1, FP16 KV, chunked prefill, one and many KV tiles; D128 has no split-KV prefill) | TBD |
 | Sink decode vs torch reference, including split-KV | TBD |
 | `sinks=None` unchanged | TBD |
 | MoE contract `(2048, 512, 256, 6)` | TBD |
@@ -307,6 +341,9 @@ request. Prompts are random and 256 output tokens are generated with
   routes. D256, XQA and the FP8 KV bridge reject sinks and keep their previous
   admission. Without `SUPPORTS_SINKS`, Flint runs on `TRITON_ATTN`, whose
   long-context prefill on Volta is several times slower.
+- On the sink route, prefill skips the prefill planner and the mixed
+  decode-rows batch, and runs no-prefix prefill on the paged kernel instead of
+  the dense one. Its cost against Triton is what the bench stage measures.
 - KV cache is FP16 only. FP8 KV is out of scope on this path, because E4M3
   does not compile in Triton on SM70.
 - No BF16 anywhere. Activations that leave the FP16 range overflow instead of

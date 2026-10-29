@@ -1945,6 +1945,10 @@ def _prefill_paged_sinks_op(native):
     return op
 
 
+def flash_attn_prefill_paged_sinks_available() -> bool:
+    return hasattr(flash_attn_v100_cuda, "prefill_paged_sinks_fwd")
+
+
 # Advertise the packaged direct-output ABI to the attention backend. Older
 # extension builds keep their existing single-request publication path.
 flash_attn_prefill_paged._sm70_dflash2_direct_bmhd = hasattr(
@@ -2255,6 +2259,7 @@ __all__ = [
     "flash_attn_lse",
     "flash_attn_qk_scores",
     "flash_attn_decode_paged",
+    "flash_attn_decode_paged_sinks_available",
     "flash_attn_decode_paged_xqa",
     "flash_attn_decode_paged_xqa_available",
     "flash_attn_grouped_verify_paged",
@@ -2265,6 +2270,7 @@ __all__ = [
     "flash_attn_turboquant_decode_paged",
     "flash_attn_turboquant_decode_paged_available",
     "flash_attn_prefill_paged",
+    "flash_attn_prefill_paged_sinks_available",
     "flash_attn_prefill_paged_d256_bm32_allp_pair_scratch",
     "flash_attn_prefill_paged_d256_bm32_allp_pair_scratch_splitkv3",
     "flash_attn_prefill_paged_bfla",

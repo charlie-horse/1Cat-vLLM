@@ -607,7 +607,12 @@ stage_audit() {
   fi
   server_down
   read -r -a extra <<<"$AUDIT_ARGS"
-  show "$PY" "$tool" --model "$MODEL_DIR" --tensor-parallel-size 2 "${extra[@]}"
+  # Run it as a module from the repo root: the TP workers import its worker
+  # extension as tools.flint.fp16_range_audit.Fp16RangeAuditExtension.
+  (cd "$REPO" && show env PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}" \
+    "$PY" -m tools.flint.fp16_range_audit --model "$MODEL_DIR" \
+    --tensor-parallel-size 2 --output "$STAGE_DIR/fp16_range_audit.json" \
+    "${extra[@]}")
   rc=$?
   case $rc in
     0) log "ok: no layer above the FP16 audit threshold" ;;
@@ -1065,10 +1070,15 @@ def cmd_verify_build(args: argparse.Namespace) -> int:
         for name in ("flash_attn_prefill_paged", "flash_attn_decode_paged"):
             params = inspect.signature(getattr(flash_attn_v100, name)).parameters
             facts[f"{name}(sinks=)"] = "sinks" in params
+        for name in ("prefill_paged_sinks_fwd", "decode_paged_sinks_fwd"):
+            facts[f"native {name}"] = hasattr(flash_attn_v100_cuda, name)
         if not facts["SUPPORTS_SINKS"]:
-            warnings.append(
-                "flash_attn_v100.SUPPORTS_SINKS is False: FLASH_ATTN_V100 rejects "
-                "sinks, so Flint runs on TRITON_ATTN"
+            # Computed from the two native sink entries, which this source
+            # tree builds: False means a stale extension build.
+            problems.append(
+                "flash_attn_v100.SUPPORTS_SINKS is False (stale extension "
+                "without the sink entries); rebuild with --stage build "
+                "--flash-only --yes, or Flint runs on TRITON_ATTN"
             )
     except Exception as exc:
         problems.append(f"flash_attn_v100: {exc}")

@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 from typing import Any
 
@@ -22,9 +22,19 @@ from vllm.v1.attention.kv_codecs import FP8_E4M3, KVCodec, resolve_kv_codec
 
 @dataclass(frozen=True)
 class PrefillConfig:
+    """Layer settings used by prefill execution.
+
+    ``sinks`` are the layer's learned attention sinks (fp32, one per local
+    query head, natural-log units), as admitted by the attention
+    implementation. With sinks, ``PrefillExecutor.forward`` runs every request
+    on the generic paged prefill kernel, the only prefill kernel with a sink
+    term, and fails closed on routes without one.
+    """
+
     policy: _config.V100AttnConfig
     scale: float
     kv_cache_dtype: str
+    sinks: torch.Tensor | None = field(default=None, compare=False)
 
     @property
     def kv_codec(self) -> KVCodec | None:
