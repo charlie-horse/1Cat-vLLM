@@ -107,6 +107,10 @@ A full build of the CUDA extensions takes about 25 minutes. The Flash-V100
 attention kernels in `flash-attention-v100/` build separately, with their own
 `setup.py`.
 
+## Docs
+
+- [V100 model playbook](docs/contributing/v100_model_playbook.md): bring up a new model on SM70 and optimize its decode.
+
 ## Upstream and license
 
 This fork builds on [1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM) and
