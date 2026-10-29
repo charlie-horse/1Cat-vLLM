@@ -393,6 +393,8 @@ def test_sinks_stay_the_backend_fp32_tensor(dist, cpu_layers, nvfp4_moe_stub, nv
 
 
 def test_load_bf16_checkpoint(dist, cpu_layers):
+    from vllm.models.flint.model import _MOE_INTERMEDIATE_SHIFT
+
     cfg = tiny_config()
     model, _ = build(cfg)
     sd = c3_state_dict(cfg, nvfp4=False)
@@ -418,15 +420,22 @@ def test_load_bf16_checkpoint(dist, cpu_layers):
     )
     gate = layer.mlp.gate.weight
     torch.testing.assert_close(gate, sd[f"{p}.mlp.gate.weight"].float())
+    # In FP16 the MoE up projections are divided by the intermediate shift
+    # and the down projections multiplied by it.
+    shift = _MOE_INTERMEDIATE_SHIFT
     shared = layer.mlp.shared_expert.gate_up_proj.weight
     torch.testing.assert_close(
         shared,
         torch.cat(
             [
                 sd[f"{p}.mlp.shared_expert.gate_proj.weight"],
-                sd[f"{p}.mlp.shared_expert.up_proj.weight"],
+                sd[f"{p}.mlp.shared_expert.up_proj.weight"] / shift,
             ]
         ).half(),
+    )
+    torch.testing.assert_close(
+        layer.mlp.shared_expert.down_proj.weight,
+        (sd[f"{p}.mlp.shared_expert.down_proj.weight"] * shift).half(),
     )
     experts = layer.mlp.experts
     for e in (0, cfg.num_experts - 1):
@@ -434,11 +443,11 @@ def test_load_bf16_checkpoint(dist, cpu_layers):
         torch.testing.assert_close(
             experts.w13_weight[e],
             torch.cat(
-                [sd[f"{base}.gate_proj.weight"], sd[f"{base}.up_proj.weight"]]
+                [sd[f"{base}.gate_proj.weight"], sd[f"{base}.up_proj.weight"] / shift]
             ).half(),
         )
         torch.testing.assert_close(
-            experts.w2_weight[e], sd[f"{base}.down_proj.weight"].half()
+            experts.w2_weight[e], (sd[f"{base}.down_proj.weight"] * shift).half()
         )
     dense = model.model.layers[0].mlp.gate_up_proj.weight
     torch.testing.assert_close(
@@ -448,11 +457,57 @@ def test_load_bf16_checkpoint(dist, cpu_layers):
     assert model.logits_processor.scale == 1.0
 
 
+def test_fp16_residual_stream_rescale(dist, cpu_layers, monkeypatch):
+    from vllm.models.flint import model as flint_model
+
+    # Start the rescale at a tiny-config MoE layer (layer 0 is dense).
+    monkeypatch.setattr(flint_model, "_FP16_STREAM_SHIFT_LAYER", 2)
+    cfg = tiny_config()
+    inv = 1.0 / flint_model._FP16_STREAM_SHIFT
+    model, _ = build(cfg)
+    layers = model.model.layers
+    assert [layer.residual_scale for layer in layers] == [None, None, inv, None]
+    assert [layer.attn_out_scale for layer in layers] == [None, None, None, inv]
+    bf16, _ = build(cfg, dtype=torch.bfloat16)
+    assert all(
+        layer.residual_scale is None and layer.attn_out_scale is None
+        for layer in bf16.model.layers
+    )
+
+    sd = c3_state_dict(cfg, nvfp4=False)
+    model.load_weights(sd.items())
+    shift = flint_model._MOE_INTERMEDIATE_SHIFT
+    for i in (1, 2, 3):
+        # Down projections join the rescaled stream from layer 2 on.
+        factor = shift * (inv if i >= 2 else 1.0)
+        p = f"model.layers.{i}.mlp"
+        torch.testing.assert_close(
+            layers[i].mlp.experts.w2_weight[0],
+            (sd[f"{p}.experts.0.down_proj.weight"] * factor).half(),
+        )
+        torch.testing.assert_close(
+            layers[i].mlp.shared_expert.down_proj.weight,
+            (sd[f"{p}.shared_expert.down_proj.weight"] * factor).half(),
+        )
+        # Attention projections are scaled at run time, not at load.
+        torch.testing.assert_close(
+            layers[i].self_attn.o_proj.weight,
+            sd[f"model.layers.{i}.self_attn.o_proj.weight"].half(),
+        )
+
+
 def test_fp16_load_rejects_out_of_range_values(dist, cpu_layers):
     cfg = tiny_config()
     model, _ = build(cfg)
     sd = c3_state_dict(cfg, nvfp4=False)
-    sd["model.layers.2.mlp.experts.3.up_proj.weight"][0, 0] = 70000.0
+    sd["model.layers.2.mlp.experts.3.gate_proj.weight"][0, 0] = 70000.0
+    with pytest.raises(ValueError, match="does not fit in FP16"):
+        model.load_weights(sd.items())
+    # The check sees the rebalanced values: a down projection that fits in
+    # FP16 on disk can leave it once multiplied by the intermediate shift.
+    model, _ = build(cfg)
+    sd = c3_state_dict(cfg, nvfp4=False)
+    sd["model.layers.2.mlp.experts.3.down_proj.weight"][0, 0] = 5000.0
     with pytest.raises(ValueError, match="does not fit in FP16"):
         model.load_weights(sd.items())
 
@@ -466,6 +521,7 @@ def test_load_nvfp4_checkpoint(dist, cpu_layers, nvfp4_moe_stub):
     from vllm.model_executor.layers.vocab_parallel_embedding import (
         UnquantizedEmbeddingMethod,
     )
+    from vllm.models.flint.model import _MOE_INTERMEDIATE_SHIFT
 
     cfg = tiny_config()
     model, _ = build(cfg, quant_config=nvfp4_config())
@@ -520,12 +576,28 @@ def test_load_nvfp4_checkpoint(dist, cpu_layers, nvfp4_moe_stub):
             experts.w2_weight_scale[e].view(torch.uint8),
             sd[f"{base}.down_proj.weight_scale"].view(torch.uint8),
         )
+        # The intermediate shift moves up's E4M3 block scales and down's
+        # global scale; gate and the gate/up global scales are untouched.
+        rows = experts.w13_weight_scale.shape[1] // 2
+        assert torch.equal(
+            experts.w13_weight_scale[e, :rows].view(torch.uint8),
+            sd[f"{base}.gate_proj.weight_scale"].view(torch.uint8),
+        )
+        torch.testing.assert_close(
+            experts.w13_weight_scale[e, rows:].float(),
+            (sd[f"{base}.up_proj.weight_scale"].float() / _MOE_INTERMEDIATE_SHIFT)
+            .to(torch.float8_e4m3fn)
+            .float(),
+            rtol=0,
+            atol=0,
+        )
         torch.testing.assert_close(
             experts.w13_weight_scale_2[e],
             torch.tensor([1e-3 * (e + 1), 1e-3 * (e + 2)]),
         )
         torch.testing.assert_close(
-            experts.w2_weight_scale_2[e], torch.tensor(1e-3 * (e + 3))
+            experts.w2_weight_scale_2[e],
+            torch.tensor(1e-3 * (e + 3) * _MOE_INTERMEDIATE_SHIFT),
         )
     # FP16 cannot hold the unscaled logits, so the scale is folded in.
     torch.testing.assert_close(

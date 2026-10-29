@@ -17,6 +17,7 @@ from collections.abc import Iterable, Iterator
 from functools import lru_cache
 from itertools import islice
 
+import regex as re
 import torch
 from torch import nn
 
@@ -70,6 +71,28 @@ _MERGED_SHARDS = {
     ".up_proj.": ".gate_up_proj.",
 }
 _LM_HEAD_SCALE = "lm_head.weight_scale_2"
+
+# FP16 headroom for the MoE intermediate silu(gate) * up. On a few
+# massive-activation tokens it exceeds FP16 (about 9.4e4 in layer 46's routed
+# experts on V100), while gate, up and the expert outputs stay in range. The
+# intermediate is rebalanced by this power of two: up is divided by it and
+# down multiplied by it, so the expert output is unchanged and only the FP16
+# intermediate shrinks. In NVFP4 checkpoints this shifts the up projection's
+# E4M3 block scales, which keeps the gate/up global scales shared, and
+# down's global scale.
+_MOE_INTERMEDIATE_SHIFT = 16
+_MOE_UP = (".mlp.experts.", ".mlp.shared_expert.")
+
+# FP16 headroom for the residual stream. From layer 46 on, a few tokens carry
+# about 3.1e4 (2.1x below the FP16 max) in the MoE output and in the residual
+# stream; earlier layers stay below 1e2. In FP16 the stream is carried divided
+# by this power of two from that layer on: the layer scales its residual after
+# the attention add, later layers scale their attention output, and every MoE
+# from that layer on is scaled through its down projection's scale at load.
+# Every RMSNorm, the final one included, is invariant to the scale.
+_FP16_STREAM_SHIFT_LAYER = 46
+_FP16_STREAM_SHIFT = 8
+_LAYER_INDEX = re.compile(r"(?:^|\.)layers\.(\d+)\.")
 
 
 def _sink_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
@@ -297,9 +320,17 @@ class FlintDecoderLayer(nn.Module):
         cache_config: CacheConfig | None,
         quant_config: QuantizationConfig | None,
         prefix: str = "",
+        fp16_stream_shift: bool = False,
     ) -> None:
         super().__init__()
         layer_idx = extract_layer_index(prefix)
+        # FP16 residual-stream rescale (see _FP16_STREAM_SHIFT_LAYER).
+        self.residual_scale: float | None = None
+        self.attn_out_scale: float | None = None
+        if fp16_stream_shift and layer_idx == _FP16_STREAM_SHIFT_LAYER:
+            self.residual_scale = 1.0 / _FP16_STREAM_SHIFT
+        elif fp16_stream_shift and layer_idx > _FP16_STREAM_SHIFT_LAYER:
+            self.attn_out_scale = 1.0 / _FP16_STREAM_SHIFT
         self.self_attn = FlintAttention(
             config,
             layer_idx,
@@ -334,7 +365,11 @@ class FlintDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         hidden_states = self.self_attn(positions, hidden_states)
+        if self.attn_out_scale is not None:
+            hidden_states = hidden_states * self.attn_out_scale
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        if self.residual_scale is not None:
+            residual = residual * self.residual_scale
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
@@ -364,10 +399,15 @@ class FlintModel(nn.Module):
             )
         else:
             self.embed_tokens = PPMissingLayer()
+        fp16_stream_shift = vllm_config.model_config.dtype == torch.float16
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: FlintDecoderLayer(
-                config, cache_config, quant_config, prefix=prefix
+                config,
+                cache_config,
+                quant_config,
+                prefix=prefix,
+                fp16_stream_shift=fp16_stream_shift,
             ),
             prefix=f"{prefix}.layers",
         )
@@ -479,6 +519,10 @@ class FlintForCausalLM(nn.Module, SupportsPP):
         weights = self._intercept_lm_head_scale(weights)
         weights = _check_merged_global_scales(weights)
         if self.check_fp16_range:
+            weights = _rebalance_moe_intermediate(weights, _MOE_INTERMEDIATE_SHIFT)
+            weights = _rescale_fp16_stream(
+                weights, _FP16_STREAM_SHIFT_LAYER, _FP16_STREAM_SHIFT
+            )
             weights = _check_fp16_range(weights)
         loader = AutoWeightsLoader(
             self,
@@ -544,6 +588,51 @@ def _check_merged_global_scales(
                             "fused linear"
                         )
                     break
+        yield name, tensor
+
+
+def _rebalance_moe_intermediate(
+    weights: Iterable[tuple[str, torch.Tensor]], shift: int
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Divide MoE up projections by ``shift`` and multiply the matching down
+    projections by it (see ``_MOE_INTERMEDIATE_SHIFT``).
+
+    A power of two only moves exponents, so this is exact except where an
+    E4M3 block scale or an FP16 value leaves the normal range. NVFP4 tensors
+    move the up projection's E4M3 block scales (``weight_scale``) and the
+    down projection's FP32 global scale (``weight_scale_2``); unquantized
+    tensors move the weights themselves.
+    """
+    for name, tensor in weights:
+        if any(block in name for block in _MOE_UP):
+            dense = name.endswith(".weight") and tensor.is_floating_point()
+            if ".up_proj." in name and (name.endswith(".weight_scale") or dense):
+                tensor = (tensor.float() / shift).to(tensor.dtype)
+            elif ".down_proj." in name and (name.endswith(".weight_scale_2") or dense):
+                tensor = (tensor.float() * shift).to(tensor.dtype)
+        yield name, tensor
+
+
+def _rescale_fp16_stream(
+    weights: Iterable[tuple[str, torch.Tensor]], start_layer: int, shift: int
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Divide the MLP/MoE down projections of layers ``>= start_layer`` by
+    ``shift`` (see ``_FP16_STREAM_SHIFT_LAYER``): their outputs then join the
+    rescaled residual stream. NVFP4 tensors move the FP32 global scale
+    (``weight_scale_2``); unquantized tensors move the weights."""
+    for name, tensor in weights:
+        match = _LAYER_INDEX.search(name)
+        if (
+            match is not None
+            and int(match.group(1)) >= start_layer
+            and ".mlp." in name
+            and ".down_proj." in name
+            and (
+                name.endswith(".weight_scale_2")
+                or (name.endswith(".weight") and tensor.is_floating_point())
+            )
+        ):
+            tensor = (tensor.float() / shift).to(tensor.dtype)
         yield name, tensor
 
 
