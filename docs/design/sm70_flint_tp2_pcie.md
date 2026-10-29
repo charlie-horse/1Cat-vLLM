@@ -103,8 +103,8 @@ CUDA_DEVICE_ORDER=PCI_BUS_ID VLLM_SKIP_P2P_CHECK=0
 PYTORCH_ALLOC_CONF=expandable_segments:True
 --tensor-parallel-size 2 --dtype half --kv-cache-dtype auto
 --max-model-len 262144 --max-num-seqs 2 --max-num-batched-tokens 8192
---gpu-memory-utilization 0.90 --enable-prefix-caching
---enable-prompt-tokens-details --enable-auto-tool-choice
+--gpu-memory-utilization 0.90 --kernel-config.sm70_skinny_moe false
+--enable-prefix-caching --enable-prompt-tokens-details --enable-auto-tool-choice
 --tool-call-parser glm47 --reasoning-parser glm47
 --exclude-tools-when-tool-choice-none --served-model-name flint
 --override-generation-config '{"temperature":1.0,"top_p":0.95,"top_k":20}'
@@ -153,7 +153,11 @@ contiguous and gathered dense prefill and the FP8 bridge. It hands its sinks
 to the decode and prefill executors through `DecodeConfig.sinks` and
 `PrefillConfig.sinks`, which pass them to the two generic kernels:
 
-- Decode takes the scalar paged decoder.
+- Decode takes the scalar paged decoder's entry point. With sinks, 8:1 GQA
+  and aligned tensors (Flint at TP1 and TP2), the extension runs it on the
+  grouped-query D128 kernel: one CTA per KV head and partition covers the
+  eight query heads. Its window-aware reducer adds the sinks. Other shapes
+  keep the per-head kernel and the generic reducer.
 - Prefill runs every request on the generic paged prefill kernel. A request
   without a prefix reads its raw K/V as one page per request, and a chunked
   or prefix request reads the paged cache. The mixed decode-rows batch is
@@ -181,8 +185,13 @@ and sliding groups and the whole model is not treated as SWA.
 
 | Route | Selection | Kernel | Contract |
 | --- | --- | --- | --- |
-| Skinny SM70 (default) | Automatic when `kernel_config.sm70_skinny_moe` is true (the default) and `Nvfp4SkinnySm70Experts.is_supported_config` admits the layer | `torch.ops._C.skinny_moe_qpn_sm70`: QPN NVFP4 grouped GEMM, FP16 activations | Hidden and per-partition intermediate sizes must tile in 16; no expert parallelism, LoRA or bias |
-| TurboMind | `--kernel-config.sm70_skinny_moe false` routes ModelOpt NVFP4 MoE to `ModelOptNvFp4SM70MoEMethod` | `nvfp4_sm70_moe.py`: TurboMind repacked FP4 with FP32 accumulation | `(hidden 2048, intermediate 512, 256 experts, top-6)` in `_SUPPORTED_CONTRACTS` |
+| Skinny SM70 | Automatic when `kernel_config.sm70_skinny_moe` is true (the engine default) and `Nvfp4SkinnySm70Experts.is_supported_config` admits the layer | `torch.ops._C.skinny_moe_qpn_sm70`: QPN NVFP4 grouped GEMM, FP16 activations | Hidden and per-partition intermediate sizes must tile in 16; no expert parallelism, LoRA or bias |
+| TurboMind (serve-script default) | `--kernel-config.sm70_skinny_moe false` routes ModelOpt NVFP4 MoE to `ModelOptNvFp4SM70MoEMethod` | `nvfp4_sm70_moe.py`: TurboMind repacked FP4 with FP32 accumulation | `(hidden 2048, intermediate 512, 256 experts, top-6)` in `_SUPPORTED_CONTRACTS` |
+
+The serve script selects TurboMind: it decodes about 40% faster than skinny
+at 4K and prefills 20-30% faster (see Decode performance). Skinny's expert
+GEMMs are faster per call, but its device-side routing adds about 25 small
+kernels per MoE layer.
 
 Both routes keep the experts packed and need `VLLM_SM70_NVFP4_TURBOMIND`
 enabled, which is the default. The router is unquantized (`*.mlp.gate` is
@@ -413,6 +422,274 @@ at 128K and 448 s at 250K.
 | Memory per GPU after graph capture | 29.6 GiB in `nvidia-smi` at utilization 0.90 | TBD |
 | `GPU KV cache size` (tokens) | 1,067,772 (`TRITON_ATTN`: 1,043,750) | TBD |
 | Maximum concurrency at 262,144 tokens | 4.07x | TBD |
+
+With the TurboMind MoE route (the serving default since the decode work
+below), weights take 12.17 GiB per GPU and the KV cache holds 982,513
+tokens, 3.75x a 262,144-token request.
+
+## Decode performance
+
+Single-stream decode on the reference host (TP2, FP16, FULL decode CUDA
+graphs). Prompts are random token ids sent to `/v1/completions`, so prefix
+caching never hits; 256 tokens are generated with `ignore_eos`. Decode
+tok/s is (tokens - 1) over the time from the first to the last streamed
+token, median of three requests after a warm-up. "Default" is the served
+sampling (temperature 1.0, top-p 0.95, top-k 20); "greedy" is temperature 0.
+
+### Baseline and result
+
+| Context | Before: default / greedy | After: default / greedy | TTFT before / after |
+| --- | ---: | ---: | ---: |
+| 4K | 52.9 / 60.0 tok/s | **96.3 / 100.6 tok/s** | 1.03 / 0.69 s |
+| 32K | 46.7 / 47.6 tok/s | **92.7 / 96.2 tok/s** | 13.07 / 10.36 s |
+| 128K | 26.9 tok/s | **77.2 tok/s** | 123.8 / 112.9 s |
+| 250K | 15.2 tok/s | **24.0 tok/s; 63.7 cool** | 422.7 / 397.9 s |
+
+Before is the integration branch at `abcc6d9`: skinny NVFP4 MoE and the
+per-head Flash-V100 paged decode kernel for sink layers. After is the
+`claude/flint-perf` branch (see Changes): the grouped decode kernel, the
+metadata fix, and routed experts on the TurboMind route. The 128K and 250K
+rows use default sampling: one request at 128K, the median of three cold
+requests at 250K. Decode right after a 250K prefill is limited by GPU 1's
+temperature; "cool" is the same context served from the prefix cache after
+a cool-down (see [Heat at 250K](#heat-at-250k)).
+
+The same host serves Qwen3.6-35B-A3B at 66 tok/s at 4K. The "about 21 tok/s"
+first seen on Flint came from long-context requests, where the 128K to 250K
+decode rate was 15-27 tok/s and prefill was the bigger cost (TTFT 124 s at
+128K, 423 s at 250K).
+
+### Where the time went
+
+The FULL decode graph was replayed on every decode step: 1 CUDA graph launch
+per token and no piecewise or eager fallback for batch sizes 1 and 2
+(`--cudagraph-metrics`). The workers block on the GPU only for the
+previous step's sampled tokens. So the cost sat in three other places,
+found with the torch profiler, `nvidia-smi` utilization sampling and a
+Python stack sampler in the workers:
+
+1. **Host: Flash-V100 metadata re-resolved the policy every step.** The
+   attention metadata builder runs outside a forward context. There, the
+   execution-policy and runtime-trace adapters build and resolve a fresh
+   standalone Flash-V100 policy from the environment on every call. Flint
+   has four KV-cache groups (14 full layers, 35 sliding ones padded to 42),
+   and every decode step resolved the policy twice per group, once to check
+   dynamic decode partitions and once to find that decode tracing is off.
+   This made up most of the 46% of the rank-0 worker's step time spent in
+   metadata building. With the TurboMind MoE route, rank 0's GPU sat idle
+   30-36% of each step, and rank 1 spent that time spinning in the first
+   all-reduce of the step. The skinny route hid it behind its own GPU time.
+2. **Kernel count: the skinny MoE routing glue.** The skinny route computes
+   its expert grouping with about 25 small PyTorch ops per MoE layer
+   (argsort, scatter, cumsum, fills, casts, and the weighted sum as
+   multiply + reduce + copies), about 115 us per layer. A decode step
+   replayed 2,466 kernels, and the graph's inter-kernel gaps alone came to
+   5.6 ms on rank 1. The TurboMind route's single-token path needs 1,197.
+3. **Attention: the per-head decode kernel.** One CTA per query head and
+   partition read each K/V row eight times (GQA 8:1). In PV, 128 threads
+   each walked the 256-token partition alone. The reducer walked every
+   partition up to the sequence length, so sliding-window layers got slower
+   with context. A full-attention layer took 0.41 ms at 32K, 1.32 ms at
+   128K and 2.38 ms at 250K per rank. At 250K the 14 full layers alone
+   took 33 ms of the 67 ms step.
+
+Hypotheses that the measurements ruled out:
+
+- **All-reduce over PCIe.** The custom one-stage all-reduce takes 10-13 us
+  per call, about 1.0-1.3 ms per token for 99 calls. The 66-101 us averages
+  in the first profiles were rank skew absorbed by the first all-reduce of
+  each step.
+- **The sampler.** Top-k plus top-p over the 150,144-entry vocab costs
+  about 0.35 ms of GPU time per token. Greedy is 0.3-0.5 ms faster per
+  token.
+- **The fp32 router.** The cast plus fp32 GEMV, split-K reduce and top-k
+  cost 1.24 ms per token, which is real but secondary.
+- **The shared-expert aux stream.** It overlaps the router and the experts;
+  disabling it is slightly slower.
+- **The forced output-token sync.** The reasoning parser makes sampling
+  keep output token ids, so each step waits for the previous step's sampled
+  token on the host. Removing that wait changed nothing measurable, so it
+  was left in place.
+
+### Per-step breakdown at 4K
+
+Rank 1, torch profiler (which inflates each kernel by about 1 us), ms per
+decoded token. After is the final build (grouped decode v3). The last row is
+the median inter-token latency without the profiler; with about 1,240
+kernels per step, the profiler's inflation is why the rows add up to more:
+
+| Component | Before | After |
+| --- | ---: | ---: |
+| Kernels per step (graph + eager) | 2,466 + 47 | 1,197 + 47 |
+| Dense NVFP4 GEMVs (TurboMind: qkv, o, shared expert) | 3.36 | 3.23 |
+| Routed-expert GEMMs | 0.93 (skinny) | 1.51 (TurboMind) |
+| MoE routing glue (sort, scatter, scan, casts, weighted sum) | ~4.1 | 0.20 |
+| Router (fp32 cast, GEMV, split-K reduce, sigmoid top-6) | 1.24 | 1.24 |
+| Attention (partition + reduce, 49 layers) | 3.10 | 1.56 |
+| All-reduce transfer (99 calls) | 1.13 | 1.08 |
+| RMSNorm, RoPE, KV write, activations, adds | ~1.4 | ~1.3 |
+| Inter-kernel gaps inside the graph | 5.6 | 1.1 |
+| lm_head, eager FP16 GEMM | 0.41 | 0.40 |
+| Sampler and logits gather, eager | ~0.45 | ~0.44 |
+| Unprofiled step (greedy / default) | 16.0 / 18.2 | 9.97 / 10.34 |
+
+Per-layer attention microbenchmark (rank shapes 16q/2kv, D128, sinks,
+CUDA-graph replay with the server's 262K workspace, including about 10 us of
+replay overhead), us per layer:
+
+| Layer, context | Per-head kernel | Grouped v1 + v2 | Grouped v3 (final) |
+| --- | ---: | ---: | ---: |
+| Full, 4K | 58.5 | 31.4 | 27.8 |
+| Full, 32K | 410.7 | 94.4 | 80.9 |
+| Full, 128K | 1,323.8 | 315.7 | 264.8 |
+| Full, 192K | 1,887.0 | 451.8 | 381.0 |
+| Full, 250K | 2,382.0 | 576.8 | 478.6 |
+| Sliding 512, 32K | 65.0 | 29.8 | 24.2 |
+| Sliding 512, 250K | 248.2 | 35.2 | 30.1 |
+
+At 128K the v3 kernel moves the 134 MB of K and V a rank holds per full
+layer at about 510 GB/s, 57% of the V100's 900 GB/s.
+
+### A/B results
+
+Decode tok/s (default / greedy) and TTFT, single stream:
+
+| Configuration | 4K | 32K | TTFT 4K / 32K |
+| --- | ---: | ---: | ---: |
+| Before (skinny, per-head attention) | 52.9 / 60.0 | 46.7 / 47.6 | 1.03 / 13.07 s |
+| + grouped decode kernel | 56.1 / 57.9 | 54.3 / 57.3 | 1.03 / 13.07 s |
+| + TurboMind MoE, no metadata fix | 49.0 / 59.1 | 49.0 / 55.1 | 0.70 / 10.36 s |
+| + metadata fix, skinny MoE | 62.3 / 63.8 | 57.2 / 58.4 | 1.03 / 13.07 s |
+| + metadata fix, TurboMind MoE | 83.0 / 88.9 | | 0.83 s |
+| + grouped decode v2 | 92.6 / 95.9 | 85.8 / 90.9 | 0.69 / 10.36 s |
+| **+ grouped decode v3 (final)** | **96.3 / 100.6** | **92.7 / 96.2** | **0.69 / 10.36 s** |
+| v2 build with PP2 (`--pp`) | 83.7 / 90.6 | 76.0 / 78.7 | 0.87 / 11.63 s |
+| v2 build with `VLLM_DISABLE_SHARED_EXPERTS_STREAM=1` | 87.1 / 91.8 | | |
+
+The rows "+ metadata fix, TurboMind MoE" and "shared-experts stream off"
+come from single 1,024-token runs; the v2 build measured 91.8 / 93.9 the
+same way. The skinny row also carried the reverted output-token change,
+which measured neutral. At 128K the v2 build decoded 53.8 tok/s and v3
+77.2 tok/s. At 250K both builds decoded about 24-25 tok/s after a cold
+prefill (v2: 24.8 tok/s, 396 s TTFT), which the next section explains.
+
+TP2 beats PP2 at every length, so the serve script keeps TP2.
+
+### Heat at 250K
+
+During the 128K decode both GPUs held the 1,380 MHz SM clock at 70-74 C and
+about 160 W. A 250K request is different. Its prefill keeps both GPUs at
+their 82-83 C operating limit for six and a half minutes, at 1,230-1,300 MHz.
+In the decode that follows, GPU 1 (`07:00.0`) has its HBM at 84-85 C, its
+85 C maximum. The driver then drops its SM clock to 250-700 MHz (thermal
+slowdown), while GPU 0 stays at 1,380 MHz. TP2 runs at the slower GPU's
+pace, so decode right after a 250K prefill measures 24-25 tok/s with a
+35-40 ms median ITL and a 77 ms p90. GPU 1's HBM runs 4-8 C hotter than GPU
+0's under the same load.
+
+Sent again from the prefix cache after a four-minute cool-down (TTFT
+1.3 s), the same 250K context decodes at 63.7 tok/s, with a 16.65 ms median
+ITL and both GPUs at 1,380 MHz. That is what the microbenchmark predicts:
+10.3 ms at 4K plus 0.45 ms more for each of the 14 full-attention layers.
+
+This is a cooling limit of the host, not of the software: more airflow over
+the second card would lift long-context decode on this box.
+
+### Quality
+
+Quality on the final configuration matches the baseline:
+
+- **Probes:** arithmetic 10/10, executed coding probes 5/5, coherent greedy
+  output, needles at 32K and 128K pass, on both the v2 and the v3 build.
+  The probe stage's "two greedy runs differ" warning shows up as on the
+  baseline; see the prefix-cache note below.
+- **Teacher forcing:** prompt logprobs against the skinny route differ by
+  0.014 nats on average (968/975 top-1 agreement). Two runs of one build
+  are bit-identical.
+- **Kernel tests:** 195 decode-sink and Flash-V100 decode tests pass on the
+  grouped kernels, including a grouped-against-per-head comparison over
+  windows, partition sizes and lengths up to 8K.
+
+### Repeated greedy requests and the prefix cache
+
+A greedy request sent twice can differ the second time, when it hits the
+prefix cache. The perf runs capture nine greedy prompts twice (128 tokens,
+top-2 logprobs) and compare the chosen token's logprob between the cold and
+the cached run:
+
+- Prompts shorter than one 16-token KV block never hit the cache and repeat
+  bit-identically: every logprob at every position, on every build.
+- Prompts of 21 and 23 tokens (one cached block) drift from the first
+  token, by 1e-4 to 1e-3 nats, growing to 0.03-0.15 over 128 tokens. Their
+  tokens still match.
+- The 4,190-token prompt drifts 0.03-0.05 nats at its first token. It
+  repeats on some builds and diverges at a near tie on others: at token 11
+  with a 0.40 margin (baseline), token 30 with a 0.002 margin (grouped v1)
+  and token 7 with a 0.18 margin (final). The grouped v2 build repeated it.
+
+The drift depends on the cache hit, not on the MoE route (skinny and
+TurboMind) or the attention kernel (per-head and grouped). A cached request
+recomputes only its uncached tail: a few rows through the dense, MoE and
+all-reduce paths instead of the whole prompt, and attention over the paged
+prefix instead of the request's raw K/V. FP16 rounding then differs at
+the 1e-3 level, which flips greedy only where the top two tokens are close.
+Nothing in these runs points at corrupted cache contents. A check that would
+settle it: compare the cached request's first-token logprobs with a cold
+request whose prompt shares the prefix but differs in its last block.
+
+### Changes
+
+In commit order on `claude/flint-perf`:
+
+1. **Grouped-query D128 paged decode for sink layers**
+   (`8d5ded61058a30f4839a4ad70895923db058dfcb`). One CTA per KV head and
+   partition covers the eight query heads. The kernel writes the same
+   partials and statistics as the per-head kernel, so the reducer still
+   applies the sinks. Only the sink entry point (fp16 KV, D128, 8:1 GQA)
+   takes it.
+2. **Flash-V100 metadata binds its per-step policy reads once**
+   (`9f98f4cac9834b45707c4f7214591cdf9a01521b`). This is the host fix.
+3. **Grouped decode v2** (`7ef09434473940f93d818fda9b8258f76083ae0c`).
+   Half-warp tokens with 16-byte K/V loads, and a reducer that skips
+   partitions before the sliding window and splits the rest across the
+   warps.
+4. **The serve script defaults to the TurboMind MoE route**
+   (`a14a870ccfcaac7f5a4f4f037fa80e0ef168d04b`):
+   `--kernel-config.sm70_skinny_moe false`.
+5. **Grouped decode v3** (`778a6332eaf7012f359742aaf6650a23de9189f4`).
+   Each of the eight warps runs PV for all eight heads over its eighth of
+   the partition, and a shared-memory pass sums the slices. This is the
+   long-context step: 128K decode goes from 53.8 to 77.2 tok/s.
+
+### Remaining ideas, by expected gain
+
+1. **TurboMind M=1 GEMVs.** About 25% at short context. The 290 TurboMind
+   GEMMs per token (dense and MoE) sit at 10-25 us each for 1-3 MB of
+   weights, 3-5x off the bandwidth bound: tile 8x128x64, split-K 5-7. A
+   dedicated M=1 GEMV, like the skinny QPN kernels the MoE route uses, or
+   wiring the QPN2/QPN4 dense decode layouts into the ModelOpt W4A16 path
+   (today only the compressed-tensors scheme admits them) could save about
+   2.5 ms per token. It needs per-projection quality qualification.
+2. **Prefill.** The largest cost of a long request: TTFT is 10.4 s at 32K,
+   113 s at 128K and 398 s at 250K, against 3-11 s of decode for 256
+   tokens. At 250K it also heats GPU 1 into thermal slowdown for the decode
+   that follows. Sink layers bypass the tuned Flash-V100 prefill routes
+   (split-KV, dense, small-query). The D128 paged prefill with sinks could
+   get a grouped-query, split-KV path, as decode now has.
+3. **Long-context attention.** About 10% at 128K and 15% at 250K. The v3
+   kernel reaches about 510 GB/s at 128K; the 14 full layers still take
+   3.7 ms per token there and 6.7 ms at 250K. More loads in flight, a
+   two-stage K/V prefetch, or context-bucketed graphs with a smaller launch
+   envelope could bring it closer to 800 GB/s.
+4. **Fused router.** About 5%. An fp16-input, fp32-weight GEMV plus the
+   sigmoid top-6 in one or two kernels would save about 0.5-0.9 ms per
+   token, at the cost of a different fp32 summation order.
+5. **Speculative decoding.** n-gram or suffix drafts for agent workloads.
+   The sink path rejects speculative configs today. The D128 verify path
+   goes through the same scalar sink-aware decode kernel and would need the
+   grouped kernel and a GPU check of verify correctness with sinks first.
+6. **Sampler.** About 3%. Apply top-k 20 before top-p to avoid sorting the
+   full vocab.
 
 ## Known limits
 
