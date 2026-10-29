@@ -951,6 +951,15 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("nvfp4_gemm_sm70_out", torch::kCUDA,
            vllm::sm70::with_policy(&nvfp4_gemm_sm70_out));
 
+  // Single-token decode of ModelOpt W4A16 dense layers: same operands and
+  // leading arguments as nvfp4_gemm_sm70_out, M branch inside the operator.
+  ops.def(
+      "nvfp4_tm_gemv_dispatch_sm70_out(Tensor(a!) out, Tensor input, "
+      "Tensor weight, Tensor scales, int group_size, int k_ld, int q_ld, "
+      "int scale_shift=14, str? native_policy=None ) -> ()");
+  ops.impl("nvfp4_tm_gemv_dispatch_sm70_out", torch::kCUDA,
+           vllm::sm70::with_policy(&nvfp4_tm_gemv_dispatch_sm70_out));
+
   ops.def(
       "nvfp4_gemm_sm70_prescaled_out(Tensor(a!) out, Tensor input, "
       "Tensor weight, Tensor scales, int group_size, int k_ld, int q_ld, "

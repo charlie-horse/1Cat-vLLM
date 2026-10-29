@@ -7,11 +7,14 @@ from typing import TYPE_CHECKING, Literal
 import torch
 
 from vllm.config.execution_policy import layer_policy
+from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.sm70_layer_workspaces import (
     register_layer_workspace,
     workspace_pool,
 )
 from vllm.platforms import current_platform
+
+logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from vllm._sm70.policy import NativeBindings
@@ -47,6 +50,9 @@ class SM70TurboMindLinearState:
     # QPN2 launch configuration (split-K, independent accumulator chains).
     split_k: int = 0
     accumulator_chains: int = 0
+    # M <= 2 runs the TurboMind-operand GEMV (see admit_modelopt_nvfp4_gemv).
+    tm_gemv: bool = False
+    tm_gemv_scale_shift: int = 14
     native_ops: "NativeBindings" = field(init=False, repr=False, compare=False)
     provider: "PreparedLinearProvider" = field(init=False, repr=False, compare=False)
 
@@ -488,6 +494,7 @@ def prepare_nvfp4_linear(
     layer: torch.nn.Module,
     interleave_gated_silu: bool = False,
     prescale_for_batch: bool = False,
+    single_token_gemv: bool = False,
 ) -> None:
     if not hasattr(torch.ops._C, "nvfp4_sm70_prepare"):
         raise RuntimeError(
@@ -550,6 +557,78 @@ def prepare_nvfp4_linear(
         padded_output_size=padded_output_size,
         prescaled_scales=prescaled_scales,
     )
+    if single_token_gemv and admit_modelopt_nvfp4_gemv(layer):
+        logger.info_once(
+            "SM70 ModelOpt NVFP4 W4A16 single-token GEMV enabled for the Flint "
+            "dense shapes (VLLM_SM70_MODELOPT_NVFP4_GEMV=0 disables it)."
+        )
+
+
+# Per-rank (K, N) of the Flint ModelOpt W4A16 dense layers at TP2: qkv, o,
+# shared-expert gate/up and down, dense MLP gate/up and down. The GEMV launch
+# table in nvfp4_tm_gemv_sm70.cu is tuned for exactly these shapes.
+MODELOPT_NVFP4_GEMV_SHAPES = frozenset(
+    {
+        (2048, 2560),
+        (2048, 2048),
+        (2048, 1024),
+        (512, 2048),
+        (2048, 6144),
+        (3072, 2048),
+    }
+)
+_FP16_MAX = 65504.0
+
+
+def _tm_gemv_scale_shift(scales: torch.Tensor) -> int:
+    """Largest power-of-two prescale (<= 2^14) that keeps FP16 scales finite.
+
+    The GEMV multiplies each FP16 scale by 2^shift and each E2M1 code (an
+    FP16 pattern worth code * 2^-14) by that, then applies 2^(14 - shift) in
+    FP32. With shift 14 every weight equals TurboMind's fp16(code * scale).
+    """
+    peak = float(scales.abs().amax())
+    shift = 14
+    while shift > 0 and peak * 2.0**shift > _FP16_MAX:
+        shift -= 1
+    return shift
+
+
+def has_tm_gemv_op() -> bool:
+    return hasattr(torch.ops._C, "nvfp4_tm_gemv_dispatch_sm70_out")
+
+
+def admit_modelopt_nvfp4_gemv(layer: torch.nn.Module) -> bool:
+    """Route M <= 2 of a prepared ModelOpt W4A16 linear to the TM GEMV.
+
+    Admitted only for the exact Flint per-rank shapes on exact SM70, plain
+    (non-gated, non-padded, non-prescaled) TurboMind NVFP4 operands and an
+    extension that has the operator. The operator keeps TurboMind for M > 2,
+    so CUDA graphs and torch.compile see a single opaque call either way.
+    """
+    state = getattr(layer, STATE_ATTR, None)
+    if state is None or state.op_kind != "nvfp4":
+        return False
+    k = int(state.weight.shape[0])
+    n = int(state.weight.shape[1]) * 8
+    if (
+        state.gated_silu
+        or state.prescaled_scales
+        or state.use_scale_code
+        or state.group_size != NVFP4_GROUP_SIZE
+        or state.padded_output_size != state.output_size
+        or (k, n) not in MODELOPT_NVFP4_GEMV_SHAPES
+        or state.k_ld != 32 * k
+        or state.q_ld != n
+        or state.scales.dtype != torch.float16
+        or not has_tm_gemv_op()
+        or not is_exact_sm70_cuda(state.weight, format_option("nvfp4", "modelopt_gemv"))
+    ):
+        return False
+    state.tm_gemv_scale_shift = _tm_gemv_scale_shift(state.scales)
+    state.tm_gemv = True
+    state.refresh_provider()
+    return True
 
 
 # Mirror of ``kQpn2DispatchMaxRows`` in nvfp4_qpn2_sm70.cu: rows up to this

@@ -38,6 +38,21 @@ def _gemm(state, x, out, prefix, *, name, gated=False):
     return out
 
 
+def _tm_gemv(state, x, out, prefix, *, gated=False):
+    # The operator branches on M itself: GEMV for M <= 2, TurboMind above.
+    state.native_ops.nvfp4_tm_gemv_dispatch_sm70_out(
+        out,
+        x,
+        state.weight,
+        state.scales,
+        state.group_size,
+        state.k_ld,
+        state.q_ld,
+        state.tm_gemv_scale_shift,
+    )
+    return out
+
+
 def _compact(state, x, out, prefix, *, gated=False):
     state.native_ops.nvfp4_qpn2_compact_tm_gemm_sm70_out(
         out, x, state.weight, state.scales, state.global_scale, state.k_ld, state.q_ld
@@ -122,6 +137,15 @@ def bind_prepared_provider(state: Any) -> PreparedLinearProvider:
             _compact,
             partial(_gemm, name=name),
             restore_interleaved=state.gated_silu,
+        )
+    if kind == "nvfp4" and getattr(state, "tm_gemv", False):
+        # Admission excludes gated, prescaled and scale-code layouts. Input
+        # handling matches TurboMind: the operator falls back to it for
+        # activations the GEMV does not take.
+        return PreparedLinearProvider(
+            "nvfp4_tm_gemv_dispatch_sm70_out",
+            _tm_gemv,
+            partial(_gemm, name="nvfp4_gemm_sm70_out"),
         )
     names = {
         "uint4": "awq_gemm_sm70_out",

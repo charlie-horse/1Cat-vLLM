@@ -1123,19 +1123,23 @@ def _explicit_nvfp4_emulation_requested() -> bool:
     )
 
 
-def _try_prepare_sm70_modelopt_nvfp4(layer: torch.nn.Module) -> bool:
+def _try_prepare_sm70_modelopt_nvfp4(
+    layer: torch.nn.Module, single_token_gemv: bool = False
+) -> bool:
     """Prepare exact-SM70 TurboMind NVFP4 weights for a ModelOpt linear.
 
     ModelOpt stores ``weight_scale_2`` / ``weight_global_scale`` as
     ``amax / (6 * 448)`` (the Marlin multiplier). TurboMind combine is
     ``block * global``. Do not infer convention from scale magnitude.
+    ``single_token_gemv`` lets M <= 2 of the qualified dense shapes read the
+    same TurboMind operands through a GEMV (W4A16 checkpoints only).
     """
     if sm70_tm.is_exact_sm70_cuda(layer.weight, sm70_tm.format_enabled("nvfp4")):
         logger.info_once(
             "SM70 ModelOpt NVFP4 TurboMind dense path enabled "
             "(weight-only; activations remain half)."
         )
-        sm70_tm.prepare_nvfp4_linear(layer)
+        sm70_tm.prepare_nvfp4_linear(layer, single_token_gemv=single_token_gemv)
     elif sm70_tm.is_turing_cuda_platform():
         config = TuringNvFp4LinearLayerConfig(
             input_dtype=get_current_vllm_config().model_config.dtype,
@@ -1581,7 +1585,7 @@ class ModelOptNvFp4W4A16LinearMethod(LinearMethodBase):
         )
         del layer.weight_scale_2
 
-        if _try_prepare_sm70_modelopt_nvfp4(layer):
+        if _try_prepare_sm70_modelopt_nvfp4(layer, single_token_gemv=True):
             return
 
         self.kernel.process_weights_after_loading(layer)

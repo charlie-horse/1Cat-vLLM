@@ -104,6 +104,7 @@ CONFIGURED_OPERATORS = GGUF_OPERATORS + (
     "nvfp4_qwen38_w13_fused_swiglu_out",
     "nvfp4_qwen38_w2_direct_reduce_out",
     "nvfp4_sm70_prepare",
+    "nvfp4_tm_gemv_dispatch_sm70_out",
     "sm70_f16_gemm",
     "sm70_f16_gemm_out",
     "sm70_f16_prepare",

@@ -562,6 +562,7 @@ if TYPE_CHECKING:
     VLLM_SM70_NVFP4_DENSE_GATED_SILU: bool = True
     VLLM_SM70_NVFP4_QPN4: bool = True
     VLLM_SM70_NVFP4_QPN4_DOWN_SCALE_CODE: bool = False
+    VLLM_SM70_MODELOPT_NVFP4_GEMV: bool = True
     VLLM_SM70_MXFP4_TURBOMIND: bool = True
     VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_B1: bool = False
     VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_MAX_TOKENS: int = 8
@@ -8574,6 +8575,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("Qpn4NvFp4LinearKernel",),
+        user_visible=False,
+    ),
+    # Single-token GEMV for the Flint ModelOpt W4A16 dense layers. It reads
+    # the resident TurboMind codes and FP16 scales, so it adds no memory.
+    # Set to 0 to run TurboMind for every batch size.
+    "VLLM_SM70_MODELOPT_NVFP4_GEMV": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_MODELOPT_NVFP4_GEMV", "1"))),
+        description=(
+            "Single-token (M <= 2) GEMV for the Flint ModelOpt W4A16 NVFP4 "
+            "dense layers on exact SM70. It reads the resident TurboMind codes "
+            "and FP16 scales, so it adds no memory. Set to 0 to run TurboMind "
+            "for every batch size."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind NVFP4",),
         user_visible=False,
     ),
     # Exact no-MTP random sampler for the Qwen3.8 TP4 batch-one contract.
