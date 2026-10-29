@@ -3679,7 +3679,14 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
   }
   const int part_tokens = part_end - part_start;
 
-  __shared__ float scores_shared[G][PARTITION_SIZE];
+  // The group's scores during QK and softmax, then the warps' PV partials.
+  constexpr int kScoreFloats = G * PARTITION_SIZE;
+  constexpr int kPartialFloats = kWarpsPerBlock * G * kGqaDecodeHeadDim;
+  __shared__ __align__(16) float
+      pv_shared[kScoreFloats > kPartialFloats ? kScoreFloats : kPartialFloats];
+  float (*scores_shared)[PARTITION_SIZE] =
+      reinterpret_cast<float (*)[PARTITION_SIZE]>(pv_shared);
+  __shared__ float inv_sum_shared[G];
   __shared__ int block_idx_shared[PARTITION_SIZE];
   __shared__ int block_offset_shared[PARTITION_SIZE];
 
@@ -3776,41 +3783,71 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
     part_sum += p;
   }
   part_sum = warp_allreduce_sum(part_sum);
-  const float inv_part_sum = part_sum > 0.f ? 1.f / part_sum : 0.f;
-  __syncwarp();
+  if (lane == 0) {
+    inv_sum_shared[warp] = part_sum > 0.f ? 1.f / part_sum : 0.f;
+  }
+  __syncthreads();
 
-  // Half-warp h accumulates tokens h, h + 2, ...; eight dims a lane.
-  float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
-  const int64_t v_head_base = static_cast<int64_t>(kv_head_idx) * v_head_stride;
-#pragma unroll 4
-  for (int t = pair_half; t < part_tokens; t += 2) {
-    float v[8];
-    load_half8_as_float(
-        v_cache + static_cast<int64_t>(block_idx_shared[t]) * v_block_stride +
-            static_cast<int64_t>(block_offset_shared[t]) * v_token_stride +
-            v_head_base + dim8,
-        v);
-    const float p = head_scores[t];
+  // PV: warp w accumulates all eight heads over its eighth of the
+  // partition, four dims a lane, so each V row is read once per CTA.
+  constexpr int kTokensPerWarp = PARTITION_SIZE / kWarpsPerBlock;
+  const int t_begin = warp * kTokensPerWarp;
+  const int t_end = min(t_begin + kTokensPerWarp, part_tokens);
+  float acc[G][4];
 #pragma unroll
-    for (int j = 0; j < 8; ++j) {
-      acc[j] = fmaf(p, v[j], acc[j]);
-    }
-  }
-#pragma unroll
-  for (int j = 0; j < 8; ++j) {
-    acc[j] += __shfl_xor_sync(0xffffffff, acc[j], 16);
-  }
-  if (pair_half == 0) {
-    uint4 packed;
-    uint32_t* words = reinterpret_cast<uint32_t*>(&packed);
+  for (int g = 0; g < G; ++g) {
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
-      const __half2 h2 = __floats2half2_rn(acc[2 * j] * inv_part_sum,
-                                           acc[2 * j + 1] * inv_part_sum);
-      words[j] = *reinterpret_cast<const uint32_t*>(&h2);
+      acc[g][j] = 0.f;
     }
-    *reinterpret_cast<uint4*>(tmp_out + tmp_out_base + dim8) = packed;
   }
+  const int64_t v_head_base = static_cast<int64_t>(kv_head_idx) * v_head_stride;
+#pragma unroll 4
+  for (int t = t_begin; t < t_end; ++t) {
+    float v[4];
+    load_half4_as_float(
+        v_cache + static_cast<int64_t>(block_idx_shared[t]) * v_block_stride +
+            static_cast<int64_t>(block_offset_shared[t]) * v_token_stride +
+            v_head_base + dim,
+        v);
+#pragma unroll
+    for (int g = 0; g < G; ++g) {
+      const float p = scores_shared[g][t];
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        acc[g][j] = fmaf(p, v[j], acc[g][j]);
+      }
+    }
+  }
+  __syncthreads();             // every warp has read the probabilities
+  float* partial = pv_shared;  // [warp][head][dim]
+#pragma unroll
+  for (int g = 0; g < G; ++g) {
+    *reinterpret_cast<float4*>(partial + (warp * G + g) * kGqaDecodeHeadDim +
+                               dim) =
+        make_float4(acc[g][0], acc[g][1], acc[g][2], acc[g][3]);
+  }
+  __syncthreads();
+  // Thread (warp = head, lane) sums its four dims over the warps' slices.
+  float total[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+  for (int w = 0; w < kWarpsPerBlock; ++w) {
+    const float4 slice = *reinterpret_cast<const float4*>(
+        partial + (w * G + warp) * kGqaDecodeHeadDim + dim);
+    total[0] += slice.x;
+    total[1] += slice.y;
+    total[2] += slice.z;
+    total[3] += slice.w;
+  }
+  const float inv_part_sum = inv_sum_shared[warp];
+  const __half2 lo =
+      __floats2half2_rn(total[0] * inv_part_sum, total[1] * inv_part_sum);
+  const __half2 hi =
+      __floats2half2_rn(total[2] * inv_part_sum, total[3] * inv_part_sum);
+  uint2 packed;
+  packed.x = *reinterpret_cast<const uint32_t*>(&lo);
+  packed.y = *reinterpret_cast<const uint32_t*>(&hi);
+  *reinterpret_cast<uint2*>(tmp_out + tmp_out_base + dim) = packed;
   if (lane == 0) {
     max_logits[stats_index] = part_max;
     exp_sums[stats_index] = part_sum;
