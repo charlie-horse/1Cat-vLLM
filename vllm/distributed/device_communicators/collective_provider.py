@@ -11,6 +11,11 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
+# Shapes of the TP2 all-reduce + fused_add_rms_norm kernel
+# (csrc/custom_all_reduce.cu): one 256-thread CTA per row.
+TP2_AR_ADD_RMS_HIDDEN_SIZE = 2048
+TP2_AR_ADD_RMS_MAX_ROWS = 16
+
 
 class NativeCollectiveBindings:
     """Bind one DSO before creating its opaque communicator.
@@ -107,6 +112,33 @@ class CollectiveCapabilities:
             and residual.is_contiguous()
             and weight.is_contiguous()
             and inp.device == residual.device == weight.device
+        )
+
+    def fused_add_rms_norm_tp2(self, inp, inp_b, residual, weight):
+        """TP2 all-reduce + fused_add_rms_norm: FP16 [1-16, 2048]."""
+        tensors = (inp, residual) if inp_b is None else (inp, inp_b, residual)
+        return bool(
+            self.world_size == 2
+            and not self.hierarchical
+            and self.reduce(inp)
+            and inp.is_cuda
+            and inp.ndim == 2
+            and 1 <= inp.shape[0] <= TP2_AR_ADD_RMS_MAX_ROWS
+            and inp.shape[1] == TP2_AR_ADD_RMS_HIDDEN_SIZE
+            and all(
+                t.dtype == torch.float16
+                and t.shape == inp.shape
+                and t.is_contiguous()
+                and t.data_ptr() % 16 == 0
+                and t.device == inp.device
+                for t in tensors
+            )
+            and weight.dtype == torch.float16
+            and weight.ndim == 1
+            and weight.numel() == TP2_AR_ADD_RMS_HIDDEN_SIZE
+            and weight.is_contiguous()
+            and weight.data_ptr() % 16 == 0
+            and weight.device == inp.device
         )
 
 

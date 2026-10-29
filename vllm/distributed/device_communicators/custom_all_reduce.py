@@ -635,6 +635,54 @@ class CustomAllreduce:
             inp, residual, weight, world_size=2, long=False
         )
 
+    def tp2_all_reduce_fused_add_rms_norm(
+        self,
+        inp: torch.Tensor,
+        inp_b: torch.Tensor | None,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        epsilon: float,
+        scale: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """All-reduce ``inp (+ inp_b)``, scale, add ``residual``, RMSNorm.
+
+        Bitwise equal to this communicator's all-reduce followed by
+        ``fused_add_rms_norm``. Callers check
+        :meth:`can_tp2_all_reduce_fused_add_rms_norm` first.
+        """
+        registered = self._IS_CAPTURING and torch.cuda.is_current_stream_capturing()
+        if inp_b is not None and not registered:
+            # Only captured buffers are IPC-registered pairwise; elsewhere
+            # add first (the same FP16 rounding) and stage the sum.
+            inp, inp_b = inp + inp_b, None
+        normalized_out = torch.empty_like(inp)
+        residual_out = torch.empty_like(residual)
+        self._native.tp2_all_reduce_fused_add_rms_norm(
+            self._ptr,
+            inp,
+            inp_b,
+            residual,
+            weight,
+            normalized_out,
+            residual_out,
+            0 if registered else self.buffer_ptrs[self.rank],
+            0 if registered else self.max_size,
+            epsilon,
+            scale,
+        )
+        return normalized_out, residual_out
+
+    def can_tp2_all_reduce_fused_add_rms_norm(
+        self,
+        inp: torch.Tensor,
+        inp_b: torch.Tensor | None,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+    ) -> bool:
+        if self.disabled or not self._native.has("tp2_all_reduce_fused_add_rms_norm"):
+            return False
+        return self.capabilities.fused_add_rms_norm_tp2(inp, inp_b, residual, weight)
+
     def sm70_tp4_all_reduce_gemma_rms_norm(
         self,
         inp: torch.Tensor,

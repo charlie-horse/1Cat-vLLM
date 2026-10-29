@@ -631,6 +631,8 @@ class CommunicationPolicy(ExecutionPolicy):
 
     gemma_rms_tp2: bool | None = None
     """Retain the existing TP2 Gemma all-reduce/RMS fusion qualification."""
+    ar_add_rms_tp2: bool | None = None
+    """Allow the TP2 all-reduce + fused_add_rms_norm fusion a model requests."""
 
     pp_static_hidden_transfer: bool | None = None
     """Retain the metadata-free single-token pipeline transfer contract."""
@@ -694,6 +696,7 @@ class CommunicationPolicy(ExecutionPolicy):
 
     aliases: ClassVar[dict[str, str]] = {
         "gemma_rms_tp2": "VLLM_SM70_TP2_AR_GEMMA_RMS_FUSION",
+        "ar_add_rms_tp2": "VLLM_SM70_FLINT_AR_RMSNORM",
         "pp_static_hidden_transfer": "VLLM_SM70_PP_STATIC_HIDDEN_TRANSFER",
         "moe_sum2_q8": "VLLM_SM70_GLM53_MOE_SUM2_ALLREDUCE_Q8",
         "top1_custom_ar": "VLLM_SM70_TOP1_CUSTOM_AR",

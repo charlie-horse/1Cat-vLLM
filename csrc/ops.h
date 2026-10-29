@@ -853,6 +853,12 @@ void sm70_tp2_all_reduce_gemma_rms_norm(
     torch::Tensor& weight, torch::Tensor& normalized_out,
     torch::Tensor& residual_out, fptr_t reg_buffer, int64_t reg_buffer_sz_bytes,
     double epsilon);
+void tp2_all_reduce_fused_add_rms_norm(
+    fptr_t _fa, torch::Tensor& inp, const std::optional<torch::Tensor>& inp_b,
+    torch::Tensor& residual, torch::Tensor& weight,
+    torch::Tensor& normalized_out, torch::Tensor& residual_out,
+    fptr_t reg_buffer, int64_t reg_buffer_sz_bytes, double epsilon,
+    double scale);
 void sm70_tp4_all_reduce_gemma_rms_norm(
     fptr_t _fa, torch::Tensor& inp, torch::Tensor& residual,
     torch::Tensor& weight, torch::Tensor& normalized_out,

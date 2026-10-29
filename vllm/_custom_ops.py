@@ -3050,6 +3050,34 @@ def sm70_tp2_all_reduce_gemma_rms_norm(
     )
 
 
+def tp2_all_reduce_fused_add_rms_norm(
+    fa: int,
+    inp: torch.Tensor,
+    inp_b: torch.Tensor | None,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    normalized_out: torch.Tensor,
+    residual_out: torch.Tensor,
+    reg_buffer: int,
+    reg_buffer_sz_bytes: int,
+    epsilon: float,
+    scale: float,
+) -> None:
+    _custom_ar_op("tp2_all_reduce_fused_add_rms_norm")(
+        fa,
+        inp,
+        inp_b,
+        residual,
+        weight,
+        normalized_out,
+        residual_out,
+        reg_buffer,
+        reg_buffer_sz_bytes,
+        epsilon,
+        scale,
+    )
+
+
 def sm70_tp4_all_reduce_gemma_rms_norm(
     fa: int,
     inp: torch.Tensor,

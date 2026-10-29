@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
+import inspect
+import math
 from importlib.util import find_spec
 from types import ModuleType
 from typing import Any
@@ -19,6 +21,9 @@ from vllm.compilation.passes.fusion.rms_quant_fusion import (
 from vllm.config import VllmConfig
 from vllm.config.utils import Range
 from vllm.distributed import get_tp_group, tensor_model_parallel_all_reduce
+from vllm.distributed.device_communicators.collective_provider import (
+    TP2_AR_ADD_RMS_HIDDEN_SIZE,
+)
 from vllm.distributed.device_communicators.custom_all_reduce import CustomAllreduce
 from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
@@ -717,6 +722,182 @@ class Sm70Tp4LongPrefillFusedNormPattern(BasePattern):
         )
 
 
+def _tp2_add_rms_match(match: pm.Match) -> bool:
+    """FP16 [M, 2048] collective inputs; M is checked again at runtime."""
+    for node in match.nodes:
+        if node.target != _ALL_REDUCE_OP:
+            continue
+        input_node = node.args[0]
+        if not isinstance(input_node, fx.Node):
+            return False
+        value = input_node.meta.get("val")
+        return bool(
+            value is not None
+            and value.dtype == torch.float16
+            and value.dim() == 2
+            and value.shape[-1] == TP2_AR_ADD_RMS_HIDDEN_SIZE
+        )
+    return False
+
+
+def _tp2_add_rms_scaled_match(match: pm.Match) -> bool:
+    # The kernel rounds fp16(fp32(x) * scale), as the elementwise multiply
+    # does, for a power-of-two FP32 scale.
+    scales = [
+        node.args[1]
+        for node in match.nodes
+        if node.target == torch.ops.aten.mul.Tensor and len(node.args) == 2
+    ]
+    if len(scales) != 1 or not isinstance(scales[0], float) or scales[0] <= 0.0:
+        return False
+    mantissa, _ = math.frexp(scales[0])
+    return mantissa == 0.5 and _tp2_add_rms_match(match)
+
+
+class Tp2AllReduceFusedAddRMSNormPattern(BasePattern):
+    """TP2: all-reduce + fused_add_rms_norm as one custom collective.
+
+    Variants, each also with only the normalized output used (final norm):
+      - ``fused_add_rms_norm(all_reduce(x), residual)``;
+      - ``fused_add_rms_norm(all_reduce(x) * scale, residual)``, a
+        power-of-two scale (a residual-stream rescale);
+      - ``fused_add_rms_norm(all_reduce(a + b), residual)``, two partial
+        outputs (shared + routed experts) summed before the collective.
+    The replacement is bitwise equal to the matched ops (see
+    csrc/custom_all_reduce.cu) and runs them unfused for shapes the kernel
+    does not take, e.g. prefill.
+    """
+
+    _SCALE_EXAMPLE = 0.125
+
+    def __init__(self, epsilon: float, dtype: torch.dtype, device: str | None):
+        super().__init__(dtype, device)
+        self.epsilon = epsilon
+        self.group_name = get_tp_group().unique_name
+
+    def _fused(self, input, input_b, residual, weight, scale):
+        return torch.ops.vllm.tp2_all_reduce_fused_add_rms_norm(
+            input,
+            input_b,
+            residual,
+            weight,
+            self.epsilon,
+            scale,
+            group_name=self.group_name,
+        )
+
+    def _norm(self, reduced, residual, weight):
+        return vllm.ir.ops.fused_add_rms_norm(reduced, residual, weight, self.epsilon)
+
+    def register(self, pm_pass: PatternMatcherPass) -> None:
+        h = TP2_AR_ADD_RMS_HIDDEN_SIZE
+
+        def plain(residual, input, weight):
+            reduced = tensor_model_parallel_all_reduce(input)
+            return self._norm(reduced, residual, weight)
+
+        def plain_fused(residual, input, weight):
+            return self._fused(input, None, residual, weight, 1.0)
+
+        def scaled(residual, input, weight, scale):
+            reduced = tensor_model_parallel_all_reduce(input)
+            return self._norm(reduced * scale, residual, weight)
+
+        def scaled_fused(residual, input, weight, scale):
+            return self._fused(input, None, residual, weight, scale)
+
+        def sum2(residual, input, input_b, weight):
+            reduced = tensor_model_parallel_all_reduce(input + input_b)
+            return self._norm(reduced, residual, weight)
+
+        def sum2_fused(residual, input, input_b, weight):
+            return self._fused(input, input_b, residual, weight, 1.0)
+
+        def normalized_only(fn):
+            # Keep the parameter names: scalar_workaround binds by name.
+            def wrapper(*args, **kwargs):
+                return fn(*args, **kwargs)[0]
+
+            wrapper.__signature__ = inspect.signature(fn)  # type: ignore[attr-defined]
+            return wrapper
+
+        two = [self.empty(5, h), self.empty(5, h), self.empty(h)]
+        three = [self.empty(5, h), self.empty(5, h), self.empty(5, h), self.empty(h)]
+        variants = [
+            # The sum2 pattern contains the plain one; try it first.
+            (sum2, sum2_fused, three, _tp2_add_rms_match, None),
+            (
+                scaled,
+                scaled_fused,
+                two,
+                _tp2_add_rms_scaled_match,
+                {"scale": self._SCALE_EXAMPLE},
+            ),
+            (plain, plain_fused, two, _tp2_add_rms_match, None),
+        ]
+        for search, replace, inputs, check, scalars in variants:
+            for wrap in (lambda fn: fn, normalized_only):
+                pm.register_replacement(
+                    wrap(search),
+                    wrap(replace),
+                    inputs,
+                    pm.fwd_only,
+                    pm_pass,
+                    extra_check=check,
+                    scalar_workaround=scalars,
+                )
+
+
+def _tp2_unfused_add_rms_boundaries(graph: fx.Graph) -> int:
+    """All-reduces still feeding a fused_add_rms_norm (missed fusions)."""
+    norm_op = vllm.ir.ops.fused_add_rms_norm.torch_op
+    count = 0
+    for node in graph.nodes:
+        if node.target != _ALL_REDUCE_OP:
+            continue
+        users = list(node.users)
+        users += [
+            u
+            for user in users
+            if user.target == torch.ops.aten.mul.Tensor
+            for u in user.users
+        ]
+        count += any(user.target == norm_op for user in users)
+    return count
+
+
+def tp2_add_rms_rejection(
+    config: VllmConfig, tp_size: int, capabilities: Any
+) -> str | None:
+    """Why the TP2 all-reduce + fused_add_rms_norm fusion is off, or None.
+
+    The model's config hook requests it (``fuse_allreduce_add_rms_tp2``) for
+    its platform and shapes; this checks the engine and the communicator.
+    """
+    if not config.parallel_config.communication.value("ar_add_rms_tp2"):
+        return "disabled (parallel_config.communication.ar_add_rms_tp2)"
+    if tp_size != 2 or config.parallel_config.pipeline_parallel_size != 1:
+        return "it needs TP2 without pipeline parallelism"
+    model_config = config.model_config
+    if model_config is None or model_config.dtype != torch.float16:
+        return "it needs an FP16 model"
+    if model_config.get_hidden_size() != TP2_AR_ADD_RMS_HIDDEN_SIZE:
+        return f"hidden size {model_config.get_hidden_size()} is not supported"
+    if capabilities is None or capabilities.world_size != 2:
+        return "the custom all-reduce is not active"
+    if not ops_have_tp2_add_rms():
+        return "the custom all-reduce extension lacks the fused collective"
+    return None
+
+
+def ops_have_tp2_add_rms() -> bool:
+    from vllm import _custom_ops as ops
+
+    return hasattr(
+        ops._custom_ar_owner_namespace(), "tp2_all_reduce_fused_add_rms_norm"
+    )
+
+
 class AllReduceFusedRMSNormStaticQuantFP8Pattern(BasePattern):
     """
     This pattern replaces the allreduce + rms norm (without residual)
@@ -1114,6 +1295,22 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
             else 0
         )
         self.sm70_tp4_total_matches = 0
+        self.tp2_add_rms_mode = False
+        if config.compilation_config.pass_config.fuse_allreduce_add_rms_tp2:
+            reason = tp2_add_rms_rejection(config, self.tp_size, capabilities)
+            if reason is not None:
+                logger.warning_once(
+                    "TP2 all-reduce + fused_add_rms_norm fusion is off: %s.", reason
+                )
+                return
+            self.tp2_add_rms_mode = True
+            self.tp2_add_rms_total_matches = 0
+            self.register_tp2_add_rms_patterns(
+                getattr(config.model_config.hf_text_config, "rms_norm_eps", 1e-6)
+            )
+            self.dump_patterns(config, self.patterns)
+            logger.info_once("Enabled the TP2 all-reduce + fused_add_rms_norm fusion.")
+            return
         self.sm70_mode = (
             self.sm70_tp2_mode or self.sm70_tp4_long_mode or self.sm70_tp4_push_mode
         )
@@ -1220,6 +1417,16 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
         self.dump_patterns(config, self.patterns)
 
     @enable_fake_mode
+    def register_tp2_add_rms_patterns(self, epsilon: float) -> None:
+        # Import registers the norm IR op even when the model is traced later.
+        import vllm.model_executor.layers.layernorm  # noqa: F401
+
+        Tp2AllReduceFusedAddRMSNormPattern(
+            epsilon, self.model_dtype, self.device
+        ).register(self.patterns)
+        self.disabled = False
+
+    @enable_fake_mode
     def register_sm70_patterns(self) -> None:
         if self.sm70_tp4_push_mode or self.sm70_tp2_mode:
             # Import registers the norm boundary even when the model is traced later.
@@ -1299,6 +1506,10 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
         if self.disabled:
             logger.warning_once("AllReduce fusion pass is disabled.")
             return False
+        if getattr(self, "tp2_add_rms_mode", False):
+            # Decode-sized rows take the fused kernel; the replacement runs
+            # the original ops for every other shape.
+            return True
         if getattr(self, "sm70_tp4_push_mode", False) or getattr(
             self, "sm70_tp2_mode", False
         ):
@@ -1324,6 +1535,23 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
             _sm70_tp4_expected_graph_matches(graph) if self.sm70_tp4_long_mode else 0
         )
         self.matched_count = self.patterns.apply(graph)
+        if getattr(self, "tp2_add_rms_mode", False):
+            self.tp2_add_rms_total_matches += self.matched_count
+            missed = _tp2_unfused_add_rms_boundaries(graph)
+            logger.debug(
+                "TP2 all-reduce + fused_add_rms_norm: %d fused in this "
+                "graph (%d in total), %d unfused.",
+                self.matched_count,
+                self.tp2_add_rms_total_matches,
+                missed,
+            )
+            if missed:
+                logger.warning_once(
+                    "TP2 all-reduce + fused_add_rms_norm fusion left %d "
+                    "all-reduce -> fused_add_rms_norm pairs unfused in a graph.",
+                    missed,
+                )
+            return
         if self.sm70_tp4_long_mode and self.matched_count != expected_graph_matches:
             if self.rank == 0:
                 logger.error(

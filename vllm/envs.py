@@ -567,6 +567,7 @@ if TYPE_CHECKING:
     VLLM_SM70_NVFP4_QPN4: bool = True
     VLLM_SM70_NVFP4_QPN4_DOWN_SCALE_CODE: bool = False
     VLLM_SM70_MODELOPT_NVFP4_GEMV: bool = True
+    VLLM_SM70_FLINT_AR_RMSNORM: bool = True
     VLLM_SM70_MXFP4_TURBOMIND: bool = True
     VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_B1: bool = False
     VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_MAX_TOKENS: int = 8
@@ -8657,6 +8658,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("TurboMind NVFP4",),
+        user_visible=False,
+    ),
+    # Flint SM70 TP2: fuse the custom all-reduce with the fused_add_rms_norm
+    # that follows it (residual add + RMSNorm in the collective's epilogue,
+    # bitwise equal). Set to 0 to keep the separate norm kernels.
+    "VLLM_SM70_FLINT_AR_RMSNORM": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_FLINT_AR_RMSNORM", "1"))),
+        description=(
+            "Flint on SM70 TP2: fuse each hidden-state custom all-reduce with "
+            "the residual add and RMSNorm that follow it (one kernel, bitwise "
+            "equal outputs) through the all-reduce + RMSNorm compile pass. "
+            "Set to 0 to keep the separate fused_add_rms_norm kernels."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 TP2 all-reduce + fused_add_rms_norm",),
         user_visible=False,
     ),
     # Exact no-MTP random sampler for the Qwen3.8 TP4 batch-one contract.

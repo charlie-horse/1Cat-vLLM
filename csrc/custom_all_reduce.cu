@@ -5,11 +5,14 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <optional>
 #include <torch/all.h>
+#include <vector>
 
 #include "custom_all_reduce.cuh"
 #if !defined(USE_ROCM)
   #include "sm70_qwen38_hc_batch.cuh"
+  #include "type_convert.cuh"
 #endif
 
 // Fake pointer type, must match fptr_t type in ops.h.
@@ -499,6 +502,113 @@ __global__ void __launch_bounds__(512, 1)
   }
 }
 
+// SM70 TP2: the one-stage all-reduce of cross_device_reduce_1stage<half, 2>
+// with fused_add_rms_norm_kernel<c10::Half, 8> as its epilogue. Every
+// rounding point of that pair is kept, so both outputs are bitwise equal to
+// all-reduce + fused_add_rms_norm:
+//   - the peer sum is upcast(rank 0) + upcast(rank 1) in FP32, rounded once
+//     to FP16 (packed_reduce); both ranks use the same order;
+//   - an optional FP32 scale of that FP16 value, rounded to FP16 (an
+//     elementwise `x * scale` between the collective and the norm);
+//   - residual = __hadd2(x, residual) (_f16Vec::operator+=), stored as FP16;
+//   - per-thread _f16Vec::sum_squares of that FP16 residual, then a CUB
+//     warp-reduction tree. Thread t owns pack t of the row, as in the
+//     1024-thread norm launch, whose threads past the row add exact zeros;
+//   - rsqrtf(variance / hidden_size + epsilon), out = fp16(x * inv * w).
+// With Sum2 each rank first adds its two inputs in FP16 (__hadd), as the
+// elementwise add that otherwise feeds the collective does.
+// One CTA per row. The end barrier is split: its flag is published once the
+// peer's input has been consumed and awaited only after the norm, so the
+// peer round trip overlaps the reduction.
+constexpr int kSm70Tp2ArAddRmsThreads = 256;
+constexpr int kSm70Tp2ArAddRmsHiddenSize = kSm70Tp2ArAddRmsThreads * 8;
+constexpr int kSm70Tp2ArAddRmsMaxRows = 16;
+
+template <int Threads, bool Sum2>
+__global__ void __launch_bounds__(Threads, 1)
+    sm70_tp2_cross_device_reduce_fused_add_rms_norm(
+        RankData* _dp, RankData* _dp_b, RankSignals sg, Signal* self_sg,
+        const half* __restrict__ residual, const half* __restrict__ weight,
+        half* __restrict__ normalized_out, half* __restrict__ residual_out,
+        int rank, int hidden_size, float epsilon, float scale) {
+  constexpr int ngpus = 2;
+  using P = typename packed_t<half>::P;
+  using A = typename packed_t<half>::A;
+  using V = _f16Vec<c10::Half, 8>;
+  using Converter = _typeConvert<c10::Half>;
+  static_assert(sizeof(P) == sizeof(V) && P::size == 8);
+
+  const int tid = threadIdx.x;
+  const int pack = blockIdx.x * Threads + tid;
+  const int peer = rank ^ 1;
+  // Index the rank tables in global memory: a by-value copy indexed by the
+  // runtime rank would live on the stack.
+  const P* own_a = reinterpret_cast<const P*>(_dp->ptrs[rank]);
+  const P* peer_a = reinterpret_cast<const P*>(_dp->ptrs[peer]);
+
+  // Local operands do not depend on the peer: load them before the barrier.
+  P own = own_a[pack];
+  if constexpr (Sum2) {
+    packed_assign_add(own, reinterpret_cast<const P*>(_dp_b->ptrs[rank])[pack]);
+  }
+  const V residual_in = reinterpret_cast<const V*>(residual)[pack];
+  const V w = reinterpret_cast<const V*>(weight)[tid];
+
+  barrier_at_start<ngpus>(sg, self_sg, rank);
+
+  P other = peer_a[pack];
+  if constexpr (Sum2) {
+    packed_assign_add(other,
+                      reinterpret_cast<const P*>(_dp_b->ptrs[peer])[pack]);
+  }
+  A acc = upcast(rank == 0 ? own : other);
+  packed_assign_add(acc, upcast(rank == 0 ? other : own));
+  P reduced = downcast<P>(acc);
+  if (scale != 1.0f) {
+  #pragma unroll
+    for (int i = 0; i < P::size; ++i) {
+      reduced.data[i] = __float2half_rn(__half2float(reduced.data[i]) * scale);
+    }
+  }
+
+  V temp = *reinterpret_cast<const V*>(&reduced);
+  temp += residual_in;
+  float variance = temp.sum_squares();
+  reinterpret_cast<V*>(residual_out)[pack] = temp;
+
+  // The peer's input has been consumed (temp depends on it): publish the
+  // final-barrier flag now and wait for the peer's only at the very end.
+  __syncthreads();
+  FlagType end_flag = 0;
+  if (tid < ngpus) {
+    end_flag = self_sg->_flag[blockIdx.x] + 1;
+    st_flag_volatile(&sg.signals[tid]->end[blockIdx.x][rank], end_flag);
+  }
+
+  using BlockReduce = cub::BlockReduce<float, Threads>;
+  __shared__ typename BlockReduce::TempStorage reduce_store;
+  __shared__ float s_variance;
+  variance = BlockReduce(reduce_store).Reduce(variance, CubAddOp{}, blockDim.x);
+  if (tid == 0) {
+    s_variance = rsqrtf(variance / hidden_size + epsilon);
+  }
+  __syncthreads();
+
+  V out;
+  #pragma unroll
+  for (int j = 0; j < 8; ++j) {
+    const float x = Converter::convert(temp.data[j]);
+    const float wf = Converter::convert(w.data[j]);
+    out.data[j] = Converter::convert(x * s_variance * wf);
+  }
+  reinterpret_cast<V*>(normalized_out)[pack] = out;
+
+  if (tid < ngpus) {
+    while (ld_flag_volatile(&self_sg->end[blockIdx.x][tid]) != end_flag);
+  }
+  if (tid == 0) self_sg->_flag[blockIdx.x] = end_flag;
+}
+
 }  // namespace vllm
 #endif
 
@@ -845,6 +955,108 @@ void all_reduce_sum2(fptr_t _fa, torch::Tensor& inp_a, torch::Tensor& inp_b,
       throw std::runtime_error(
           "custom allreduce sum2 only supports float32, float16 and bfloat16");
   }
+}
+
+/**
+ * TP2 all-reduce whose epilogue is fused_add_rms_norm (FP16, hidden 2048,
+ * 1-16 rows; written for and admitted on SM70 PCIe pairs):
+ *   x = all_reduce(inp [+ inp_b]) [* scale]
+ *   residual_out = x + residual
+ *   normalized_out = rms_norm(residual_out) * weight
+ * Bitwise equal to the custom all-reduce followed by fused_add_rms_norm.
+ * inp_b (a second input added in FP16 on each rank before the reduction)
+ * requires CUDA graph capture, where both inputs are IPC-registered. If
+ * _reg_buffer is non-zero, inp is first copied into it, as in all_reduce.
+ */
+void tp2_all_reduce_fused_add_rms_norm(
+    fptr_t _fa, torch::Tensor& inp, const std::optional<torch::Tensor>& inp_b,
+    torch::Tensor& residual, torch::Tensor& weight,
+    torch::Tensor& normalized_out, torch::Tensor& residual_out,
+    fptr_t _reg_buffer, int64_t reg_buffer_sz_bytes, double epsilon,
+    double scale) {
+#if defined(USE_ROCM)
+  TORCH_CHECK(false, "TP2 fused all-reduce RMSNorm is unavailable on ROCm");
+#else
+  auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(inp));
+  auto stream = c10::cuda::getCurrentCUDAStream().stream();
+  constexpr int kThreads = vllm::kSm70Tp2ArAddRmsThreads;
+
+  TORCH_CHECK(
+      fa->world_size_ == 2 && vllm::custom_allreduce_current_device_is_sm70(),
+      "TP2 fused all-reduce RMSNorm requires TP2 on SM70");
+  TORCH_CHECK(inp.dim() == 2 && inp.size(1) == vllm::kSm70Tp2ArAddRmsHiddenSize,
+              "TP2 fused all-reduce RMSNorm requires [M, ",
+              vllm::kSm70Tp2ArAddRmsHiddenSize, "] input");
+  const int64_t rows = inp.size(0);
+  TORCH_CHECK(rows >= 1 && rows <= vllm::kSm70Tp2ArAddRmsMaxRows,
+              "TP2 fused all-reduce RMSNorm supports 1-",
+              vllm::kSm70Tp2ArAddRmsMaxRows, " rows, got ", rows);
+  std::vector<const torch::Tensor*> tensors = {&inp, &residual, &normalized_out,
+                                               &residual_out};
+  if (inp_b.has_value()) tensors.push_back(&inp_b.value());
+  for (const torch::Tensor* t : tensors) {
+    TORCH_CHECK(t->is_cuda() && t->device() == inp.device() &&
+                    t->scalar_type() == at::ScalarType::Half &&
+                    t->sizes() == inp.sizes() && t->is_contiguous() &&
+                    reinterpret_cast<uintptr_t>(t->data_ptr()) % 16 == 0,
+                "TP2 fused all-reduce RMSNorm requires aligned, "
+                "contiguous FP16 tensors of the input shape");
+  }
+  TORCH_CHECK(weight.is_cuda() && weight.device() == inp.device() &&
+                  weight.scalar_type() == at::ScalarType::Half &&
+                  weight.dim() == 1 && weight.numel() == inp.size(1) &&
+                  weight.is_contiguous() &&
+                  reinterpret_cast<uintptr_t>(weight.data_ptr()) % 16 == 0,
+              "TP2 fused all-reduce RMSNorm requires an aligned FP16 "
+              "weight of the hidden size");
+
+  cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+  AT_CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
+  const bool capturing = capture_status == cudaStreamCaptureStatusActive;
+  TORCH_CHECK(!inp_b.has_value() || (capturing && _reg_buffer == 0),
+              "TP2 fused all-reduce RMSNorm takes a second input only "
+              "under CUDA graph capture");
+
+  void* input_ptr = inp.data_ptr();
+  auto reg_buffer = reinterpret_cast<void*>(_reg_buffer);
+  if (reg_buffer) {
+    const int64_t input_size = inp.numel() * inp.element_size();
+    TORCH_CHECK_LE(input_size, reg_buffer_sz_bytes);
+    AT_CUDA_CHECK(cudaMemcpyAsync(reg_buffer, input_ptr, input_size,
+                                  cudaMemcpyDeviceToDevice, stream));
+    input_ptr = reg_buffer;
+  }
+  vllm::RankData* ptrs = fa->rank_data_for_buffer(
+      stream, input_ptr, "TP2 fused all-reduce RMSNorm input");
+  vllm::RankData* ptrs_b = nullptr;
+  if (inp_b.has_value()) {
+    ptrs_b = fa->rank_data_for_buffer(stream, inp_b->data_ptr(),
+                                      "TP2 fused all-reduce RMSNorm input");
+  }
+
+  const auto* residual_ptr = reinterpret_cast<const half*>(residual.data_ptr());
+  const auto* weight_ptr = reinterpret_cast<const half*>(weight.data_ptr());
+  auto* normalized_ptr = reinterpret_cast<half*>(normalized_out.data_ptr());
+  auto* residual_out_ptr = reinterpret_cast<half*>(residual_out.data_ptr());
+  const int hidden_size = static_cast<int>(inp.size(1));
+  const float epsilon_f = static_cast<float>(epsilon);
+  const float scale_f = static_cast<float>(scale);
+  if (ptrs_b != nullptr) {
+    vllm::sm70_tp2_cross_device_reduce_fused_add_rms_norm<kThreads, true>
+        <<<rows, kThreads, 0, stream>>>(
+            ptrs, ptrs_b, fa->sg_, fa->self_sg_, residual_ptr, weight_ptr,
+            normalized_ptr, residual_out_ptr, fa->rank_, hidden_size, epsilon_f,
+            scale_f);
+  } else {
+    vllm::sm70_tp2_cross_device_reduce_fused_add_rms_norm<kThreads, false>
+        <<<rows, kThreads, 0, stream>>>(
+            ptrs, nullptr, fa->sg_, fa->self_sg_, residual_ptr, weight_ptr,
+            normalized_ptr, residual_out_ptr, fa->rank_, hidden_size, epsilon_f,
+            scale_f);
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+#endif
 }
 
 void sm70_qwen38_hc_down_local(torch::Tensor input, torch::Tensor packed,
