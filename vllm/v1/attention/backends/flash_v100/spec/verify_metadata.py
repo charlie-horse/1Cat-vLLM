@@ -125,6 +125,12 @@ def update_decode_metadata(
     workspace_seq_capacity_cap: int | None = None,
     partition_size_hint: int | None = None,
 ) -> None:
+    if int(getattr(attn_metadata, "max_query_len", 1)) <= 1:
+        # Single-token decode never takes the small-query path. Return before
+        # the profiling flag and policy reads: this runs once per KV-cache
+        # group on every decode step. Same result as the guard below.
+        self._clear_smallq_decode_metadata(attn_metadata)
+        return
     flash_metadata = metadata_view(attn_metadata)
     profile_enabled = policy.worker_profile_enabled()
     profile_t0 = time.perf_counter() if profile_enabled else 0.0

@@ -110,6 +110,10 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
     # Flash-V100 policy on every call: per KV-cache group and decode step.
     _decode_dynamic_partitions: bool | None = None
     _trace_decode_active: bool | None = None
+    # Value the last runtime build wrote into _decode_active_num_partitions
+    # (None: unknown). Decode kernels only read that device tensor, so a build
+    # whose partition count did not change skips the fill launch.
+    _decode_active_num_partitions_value: int | None = None
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -309,7 +313,8 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
 
         seq_lens_cpu = getattr(attn_metadata, "seq_lens_cpu", None)
         if seq_lens_cpu is not None and seq_lens_cpu.numel() > 0:
-            max_seq_len_hint = int(seq_lens_cpu.max().item())
+            # One tolist() instead of max() + item(): per group and step.
+            max_seq_len_hint = int(max(seq_lens_cpu.tolist()))
         else:
             max_seq_len_hint = int(getattr(common_attn_metadata, "max_seq_len", 0) or 0)
         if max_seq_len_hint <= 0:
@@ -348,6 +353,7 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
                 dtype=torch.int32,
                 device=self.device,
             )
+            self._decode_active_num_partitions_value = None
         return self._decode_active_num_partitions
 
     def _update_decode_active_num_partitions(
@@ -388,7 +394,13 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         )
         active = max(1, (int(max_seq_len_hint) + partition_size - 1) // partition_size)
         active_num_partitions = self._ensure_decode_active_num_partitions()
-        active_num_partitions.fill_(active)
+        if stage != "build" or self._decode_active_num_partitions_value != active:
+            active_num_partitions.fill_(active)
+            # Only runtime builds trust the cached value; capture and draft
+            # stages always fill and force the next build to refill.
+            self._decode_active_num_partitions_value = (
+                active if stage == "build" else None
+            )
         flash_metadata.flash_v100_decode_active_num_partitions = active_num_partitions
         if self._trace_decode_active is False:
             return

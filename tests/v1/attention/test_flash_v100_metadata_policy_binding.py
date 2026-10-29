@@ -78,3 +78,31 @@ def test_unbound_builder_resolves_the_flags_per_call(monkeypatch):
     builder = _builder()
     builder._update_decode_active_num_partitions(_metadata(), stage="build")
     assert calls == ["p", "trace"]
+
+
+def test_unchanged_active_partition_count_skips_the_refill():
+    builder = _builder(_decode_dynamic_partitions=True, _trace_decode_active=False)
+    active = builder._decode_active_num_partitions
+
+    def update(seq_len, stage="build"):
+        metadata = _metadata(seq_len)
+        builder._update_decode_active_num_partitions(metadata, stage=stage)
+        assert metadata.flash_v100_decode_active_num_partitions is active
+
+    update(4096)
+    assert int(active[0]) == 4096 // 256
+    # Kernels only read the tensor, so a repeated count must not relaunch
+    # the fill. A sentinel shows whether the builder wrote it again.
+    active.fill_(-1)
+    update(4096)
+    assert int(active[0]) == -1
+    update(8192)
+    assert int(active[0]) == 8192 // 256
+    # Capture and draft builds always fill and invalidate the cached count.
+    for stage in ("capture", "draft0"):
+        active.fill_(-1)
+        update(8192, stage=stage)
+        assert int(active[0]) == 8192 // 256
+        active.fill_(-1)
+        update(8192)
+        assert int(active[0]) == 8192 // 256

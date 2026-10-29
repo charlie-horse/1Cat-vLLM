@@ -56,6 +56,12 @@ def test_metadata_capture_capacity_is_fixed_and_copy_refreshes_live_storage():
     )
     assert table[0].tolist() == [7, 8, 9]
     assert lengths[0] == 11 and starts[:2].tolist() == [0, 3]
+    views = draft.views(1)
+    assert draft.views(1) is views
+    assert [v.data_ptr() for v in views] == [
+        t.data_ptr() for t in (table, lengths, starts)
+    ]
+    assert [tuple(v.shape) for v in views] == [(1, 3), (1,), (2,)]
     assert smallq.ensure(16, 2, 3, 8, 1, device)
     table, indices = smallq.block_table, smallq.token_indices
     assert smallq.ensure(32, 4, 3, 16, 2, device)

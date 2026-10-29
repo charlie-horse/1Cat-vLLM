@@ -300,6 +300,11 @@ class DraftBuffers:
     seq_lens: torch.Tensor | None = None
     query_start_loc: torch.Tensor | None = None
     shape: tuple[int, int] | None = None
+    # [:num_reqs] views of the persistent allocation, built once per request
+    # count: every KV-cache group refreshes them on every decode step.
+    _views: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = field(
+        default_factory=dict, repr=False, compare=False
+    )
 
     def ensure(
         self,
@@ -316,6 +321,7 @@ class DraftBuffers:
             old_reqs, old_block_cols = self.shape
             return required_reqs <= old_reqs and block_cols == old_block_cols
 
+        self._views.clear()
         self.block_table = torch.empty(
             (req_capacity, block_cols),
             dtype=torch.int32,
@@ -334,6 +340,23 @@ class DraftBuffers:
         self.shape = shape
         return True
 
+    def views(self, num_reqs: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Block table, seq_lens and query_start_loc views for num_reqs."""
+        views = self._views.get(num_reqs)
+        if views is None:
+            assert self.block_table is not None
+            assert self.seq_lens is not None
+            assert self.query_start_loc is not None
+            # The allocation never moves once made (ensure() only allocates
+            # into an empty workspace), so these views stay valid.
+            views = (
+                self.block_table[:num_reqs],
+                self.seq_lens[:num_reqs],
+                self.query_start_loc[: num_reqs + 1],
+            )
+            self._views[num_reqs] = views
+        return views
+
     def copy_metadata(
         self,
         block_table: torch.Tensor,
@@ -341,17 +364,11 @@ class DraftBuffers:
         query_start_loc: torch.Tensor,
     ) -> None:
         """Refresh the three persistent inputs of a non-causal graph."""
-        num_reqs = seq_lens.numel()
-        assert self.block_table is not None
-        assert self.seq_lens is not None
-        assert self.query_start_loc is not None
-        self.block_table[:num_reqs].copy_(block_table, non_blocking=True)
-        self.seq_lens[:num_reqs].copy_(
-            seq_lens,
-            non_blocking=True,
-        )
-        self.query_start_loc[: num_reqs + 1].copy_(
-            query_start_loc,
+        # One multi-tensor copy instead of three copy_ launches: this runs
+        # for every KV-cache group on every decode step.
+        torch._foreach_copy_(
+            list(self.views(seq_lens.numel())),
+            [block_table, seq_lens, query_start_loc],
             non_blocking=True,
         )
 

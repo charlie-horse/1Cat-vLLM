@@ -90,21 +90,18 @@ def stabilize_draft_graph_metadata(
             "Replay would otherwise read stale draft metadata."
         )
 
-    assert self.metadata_workspace.draft.block_table is not None
-    assert self.metadata_workspace.draft.seq_lens is not None
-    assert self.metadata_workspace.draft.query_start_loc is not None
-
     self.copy_dflash_graph_metadata(
         block_table,
         attn_metadata.seq_lens[:num_reqs],
         attn_metadata.query_start_loc[: num_reqs + 1],
     )
 
-    attn_metadata.block_table = self.metadata_workspace.draft.block_table[:num_reqs]
-    attn_metadata.seq_lens = self.metadata_workspace.draft.seq_lens[:num_reqs]
-    attn_metadata.query_start_loc = self.metadata_workspace.draft.query_start_loc[
-        : num_reqs + 1
-    ]
+    # Cached views of the persistent allocation; it never moves once made.
+    (
+        attn_metadata.block_table,
+        attn_metadata.seq_lens,
+        attn_metadata.query_start_loc,
+    ) = self.metadata_workspace.draft.views(num_reqs)
 
 
 def build_for_drafting(self: Any, common_attn_metadata, draft_index: int):
