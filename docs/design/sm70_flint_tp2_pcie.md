@@ -661,15 +661,120 @@ In commit order on `claude/flint-perf`:
    the partition, and a shared-memory pass sums the slices. This is the
    long-context step: 128K decode goes from 53.8 to 77.2 tok/s.
 
+### Single-token NVFP4 GEMV
+
+Item 1 of the remaining ideas, on `claude/flint-m1-fp4`. At decode batch 1
+and 2, the dense ModelOpt W4A16 projections and the routed experts leave
+TurboMind for two dedicated paths. Prefill (M > 2) keeps TurboMind. Both
+paths read the TurboMind-prepared weights in place (`tm_weight` codes and the
+fp16 `tm_scales` that already fold in `weight_scale_2` and Flint's
+FP16-overflow rescale), so they add no weight copies, and both accumulate in
+FP32.
+
+- **Dense GEMV** (`nvfp4_tm_gemv_sm70.cu`, op
+  `nvfp4_tm_gemv_dispatch_sm70_out`). Admitted at load only for ModelOpt
+  W4A16 on SM70 and Flint's six per-rank shapes. The M <= 2 / TurboMind
+  branch lives inside the op, so the compiled graph sees one call per
+  projection. Kill switch: `VLLM_SM70_MODELOPT_NVFP4_GEMV=0`.
+- **Routed-expert decode** (`nvfp4_moe_decode_qpn_sm70.cu`). Two kernels
+  per layer instead of TurboMind's 5 (M=1) or about 10 (M=2): W13 with a
+  fused SwiGLU, reading the expert ids on the device, then W2 with the
+  top-k weighted reduce. Reductions run in a fixed order (no float
+  atomics). A 384 KiB workspace per layer is the only extra memory. A
+  load-time power-of-two pre-shift guards the fp16 scale product against
+  overflow; on the real checkpoint no layer needs it (largest W2 scale
+  1.18). Kill switch: `VLLM_SM70_FLINT_MOE_QPN_DECODE=0`.
+
+Both switches are read when the layers load. Qwen3.x routes are keyed on
+their own schemes and shapes and do not change.
+
+Kernel microbenchmark (`benchmarks/kernels/benchmark_sm70_nvfp4_m1.py`; CUDA
+graph, cold L2, median of 200 replays, median of 3 runs), us at M=1 / M=2,
+new-path GB/s at M=1 counting 4.5 bits per weight:
+
+| Shape (K x N), per layer | TurboMind | QPN2 shared | New | GB/s |
+| --- | ---: | ---: | ---: | ---: |
+| qkv 2048 x 2560 | 23.10 / 17.98 | 7.96 / 7.96 | 7.17 / 7.51 | 411 |
+| o 2048 x 2048 | 16.76 / 16.76 | 7.07 / 7.17 | 6.61 / 6.89 | 357 |
+| Shared gate_up 2048 x 1024 | 15.81 / 15.87 | 6.53 / 6.56 | 4.61 / 4.80 | 256 |
+| Shared down 512 x 2048 | 9.09 / 9.09 | 3.71 / 3.78 | 3.78 / 4.10 | 156 |
+| Dense gate_up 2048 x 6144 | 23.04 / 23.30 | 16.64 / 16.64 | 13.82 / 14.34 | 512 |
+| Dense down 3072 x 2048 | 20.86 / 20.99 | 9.34 / 9.34 | 8.32 / 8.70 | 425 |
+| Routed experts, top-6 | 40.83 / 57.22 | | 17.28 / 27.14 | 307 |
+
+Summed per token (qkv and o x49, shared expert x47, dense MLP x2, routed
+experts x47), the kernels go from 5.13 to 1.93 ms at M=1 and from 5.65 to
+2.45 ms at M=2.
+
+The 70%-of-HBM target was not reached. On this V100 a pure streaming-read
+kernel over the same byte counts reaches only 258-698 GB/s for 0.66-7.9 MB,
+and each kernel in a graph costs about 1.15 us before it does any work. The
+new GEMV sits 1.2-2.5 us above that read-only floor per shape; with the
+weights resident in L2 it is barely faster, so per-CTA latency, not HBM,
+is the limit.
+
+**The host became the limit.** With the new kernels the decode graph takes
+7.55 ms of GPU time, but each worker spent 8.0-9.5 ms of host time in
+`execute_model` plus about 1.4 ms in `sample_tokens`. Step time then
+followed the CPU clock (1.7-3.0 GHz on this host): runs landed anywhere
+from 9.0 to 11.5 ms per token, the GPU sat idle 2-4 ms per step, and the
+ranks drifted up to about 5.5 ms apart. The old path's 9.6 ms graph had
+hidden this. Most of the host time is attention metadata, about 1.2 ms for
+each of the four KV-cache groups. Two per-step calls ran without an engine
+config in scope and rebuilt a policy from the environment on every call:
+`configured_smallq_max_query_len()` (0.77 ms, once per group) and
+`_should_record_sm70_sample_hidden_ready_event()` (0.27 ms). Both now
+borrow the policy the engine already resolved from `vllm_config` and fall
+back to the old lookup without one. Host work is now about 5-6 ms per step
+against 7.5 ms of GPU work, so the next GPU saving will meet the host
+again; the remaining metadata cost is the next target.
+
+End to end (single stream, random-token prompts, 256 tokens, median of 3
+unless noted). The before columns are this branch with both kill switches
+at `0` in the same tree (old path) and the doc's earlier result:
+
+| Context, sampling | Old path | New path | ITL new | TTFT |
+| --- | ---: | ---: | ---: | ---: |
+| 4K, default | 96.7 tok/s (10.34 ms) | **118.5 tok/s** | 8.46 ms | 0.69 s |
+| 4K, greedy | 100.3 tok/s (9.97 ms) | **124.0 tok/s** | 8.09 ms | 0.69 s |
+| 32K, default (1 run) | 92.7 tok/s (doc) | **110.4 tok/s** | 9.07 ms | 10.37 s |
+
+That is +23% (default) and +24% (greedy) at 4K, and +19% at 32K, where
+attention keeps the step GPU-bound. TTFT does not change: prefill keeps
+TurboMind. The TTFT column comes from the run before the host fix, with the
+same kernels.
+
+Correctness:
+
+- GPU unit tests compare every shape at M=1 and M=2 against an FP32
+  dequantized reference and against TurboMind, including CUDA-graph
+  replay; the 1-200-token MoE reference test passes.
+- On real Flint weights (layers 0, 5 and 22, float64 reference), the new
+  paths are exactly as accurate as TurboMind: median relative error
+  2.1-3.3e-4 dense and 7.4-8.3e-4 for the MoE block, for both. They differ
+  from TurboMind by about 1e-5 (dense) and 1e-4 (MoE). The MoE path rounds
+  each expert's output to fp16 before the weighted sum, as TurboMind does.
+- Greedy (9 prompts x 128 tokens, old vs new path): 4 of 9 identical,
+  including the 4K prompt. Mean logprob drift is 0.011 (median 0.0003,
+  max 0.69). Dense-only and MoE-only servers each drift about as much as
+  both together, and all flips but one are near-ties (top-2 margin
+  <= 0.31); the exception follows already degenerate text.
+- TurboMind itself is not reproducible across server starts: it times
+  tactics live at M <= 64, and five fresh processes gave 2-3 distinct
+  outputs for qkv at M=1/2 and for the MoE at M=1. The coordinated tuning
+  also logs "no LUT; rank 1 is falling back to local tuning". The new
+  decode paths give one result every time.
+- Quality probes: math 10/10, code 5/5, needle at 32K 3/3.
+
 ### Remaining ideas, by expected gain
 
-1. **TurboMind M=1 GEMVs.** About 25% at short context. The 290 TurboMind
-   GEMMs per token (dense and MoE) sit at 10-25 us each for 1-3 MB of
-   weights, 3-5x off the bandwidth bound: tile 8x128x64, split-K 5-7. A
-   dedicated M=1 GEMV, like the skinny QPN kernels the MoE route uses, or
-   wiring the QPN2/QPN4 dense decode layouts into the ModelOpt W4A16 path
-   (today only the compressed-tensors scheme admits them) could save about
-   2.5 ms per token. It needs per-projection quality qualification.
+1. **TurboMind M=1 GEMVs.** Done; see
+   [Single-token NVFP4 GEMV](#single-token-nvfp4-gemv). What is left there,
+   by expected gain: host-side attention metadata (about 1 ms per KV-cache
+   group per step, now within about 2 ms of the GPU time); one persistent
+   kernel for the routed experts, so W2 loads while W13 runs (about 3-5 us
+   per layer); and reproducible TurboMind tactic selection (shared LUT
+   across ranks, warm-up for prefill lengths 3-15).
 2. **Prefill.** The largest cost of a long request: TTFT is 10.4 s at 32K,
    113 s at 128K and 398 s at 250K, against 3-11 s of decode for 256
    tokens. At 250K it also heats GPU 1 into thermal slowdown for the decode
