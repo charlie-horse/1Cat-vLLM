@@ -3549,6 +3549,274 @@ __global__ void flash_attention_decode_qk_scores_kernel(
   }
 }
 
+// Query heads per KV head that the grouped D128 decode kernel covers.
+constexpr int kGqaDecodeGroup = 8;
+constexpr int kGqaDecodeHeadDim = 128;
+
+__device__ __forceinline__ float warp_allreduce_sum(float val) {
+#pragma unroll
+  for (int offset = kWarpSize / 2; offset > 0; offset /= 2) {
+    val += __shfl_xor_sync(0xffffffff, val, offset);
+  }
+  return val;
+}
+
+__device__ __forceinline__ float warp_allreduce_max(float val) {
+#pragma unroll
+  for (int offset = kWarpSize / 2; offset > 0; offset /= 2) {
+    val = fmaxf(val, __shfl_xor_sync(0xffffffff, val, offset));
+  }
+  return val;
+}
+
+__device__ __forceinline__ void load_half4_as_float(const __half* ptr,
+                                                    float (&out)[4]) {
+  const uint2 raw = *reinterpret_cast<const uint2*>(ptr);
+  const float2 lo = __half22float2(*reinterpret_cast<const __half2*>(&raw.x));
+  const float2 hi = __half22float2(*reinterpret_cast<const __half2*>(&raw.y));
+  out[0] = lo.x;
+  out[1] = lo.y;
+  out[2] = hi.x;
+  out[3] = hi.y;
+}
+
+// Grouped-query paged decode partition for head_dim 128, fp16 KV and eight
+// query heads per KV head. One CTA covers the whole query group of one KV
+// head, so each K/V row is read once per group instead of once per query
+// head, and no thread walks the partition alone:
+//   QK      warp w scores tokens w, w + 8, ...; each lane holds four dims of
+//           the eight queries and of the key row (coalesced 256-byte rows),
+//           and a reduce-scatter butterfly leaves head (lane >> 2) & 7's
+//           score on four lanes (9 shuffles per token for 8 heads).
+//   softmax warp w owns query head w of the group.
+//   PV      warp w accumulates head w over the partition, four dims a lane.
+// Its partials and (max, sum) statistics have exactly the layout and meaning
+// of flash_attention_decode_partition_kernel's, so the generic reducer,
+// which applies learned attention sinks, combines them unchanged.
+template <int PARTITION_SIZE>
+__global__ void __launch_bounds__(kThreadsPerBlock)
+    flash_attention_decode_gqa8_d128_partition_kernel(
+        const __half* __restrict__ q, const __half* __restrict__ k_cache,
+        const __half* __restrict__ v_cache, __half* __restrict__ tmp_out,
+        float* __restrict__ max_logits, float* __restrict__ exp_sums,
+        const int* __restrict__ block_table, const int* __restrict__ seq_lens,
+        const int* __restrict__ active_num_partitions, const int batch_size,
+        const int max_num_blocks, const int max_num_partitions,
+        const int num_heads_kv, const int block_size, const int64_t q_stride0,
+        const int64_t q_stride1, const int64_t tmp_out_stride0,
+        const int64_t tmp_out_stride1, const int64_t tmp_out_stride2,
+        const int64_t stats_stride0, const int64_t stats_stride1,
+        const int64_t k_block_stride, const int64_t k_token_stride,
+        const int64_t k_head_stride, const int64_t v_block_stride,
+        const int64_t v_token_stride, const int64_t v_head_stride,
+        const float softmax_scale, const int window_size_left,
+        const int window_size_right) {
+  constexpr int G = kGqaDecodeGroup;
+  static_assert(kWarpsPerBlock == G, "one warp per query head of the group");
+  static_assert(kGqaDecodeHeadDim == 4 * kWarpSize, "four dims per lane");
+  const int batch_idx = blockIdx.x;
+  const int kv_head_idx = blockIdx.y;
+  const int partition_idx = blockIdx.z;
+  if (batch_idx >= batch_size || kv_head_idx >= num_heads_kv ||
+      partition_idx >= max_num_partitions) {
+    return;
+  }
+  const int seq_len = seq_lens[batch_idx];
+  const int start_token_idx = partition_idx * PARTITION_SIZE;
+  if (seq_len <= 0 || start_token_idx >= seq_len) {
+    return;
+  }
+  const int runtime_num_partitions = active_num_partitions[0];
+  const int seq_num_partitions =
+      (seq_len + PARTITION_SIZE - 1) / PARTITION_SIZE;
+  const int effective_num_partitions =
+      min(max_num_partitions, max(runtime_num_partitions, seq_num_partitions));
+  if (partition_idx >= effective_num_partitions) {
+    return;
+  }
+
+  const int query_pos = seq_len - 1;
+  const int min_token_idx =
+      window_size_left >= 0 ? max(0, query_pos - window_size_left) : 0;
+  const int max_token_idx =
+      window_size_right >= 0 ? min(seq_len - 1, query_pos + window_size_right)
+                             : seq_len - 1;
+  const int part_start = max(start_token_idx, min_token_idx);
+  const int part_end = min(start_token_idx + PARTITION_SIZE, max_token_idx + 1);
+
+  const int lane = threadIdx.x % kWarpSize;
+  const int warp = threadIdx.x / kWarpSize;
+  const int dim = 4 * lane;
+  // Softmax and PV: this warp's query head.
+  const int head_idx = kv_head_idx * G + warp;
+  const int64_t tmp_out_base =
+      static_cast<int64_t>(batch_idx) * tmp_out_stride0 +
+      static_cast<int64_t>(head_idx) * tmp_out_stride1 +
+      static_cast<int64_t>(partition_idx) * tmp_out_stride2;
+  const int64_t stats_index = static_cast<int64_t>(batch_idx) * stats_stride0 +
+                              static_cast<int64_t>(head_idx) * stats_stride1 +
+                              partition_idx;
+  if (part_start >= part_end) {
+    *reinterpret_cast<uint2*>(tmp_out + tmp_out_base + dim) = make_uint2(0, 0);
+    if (lane == 0) {
+      max_logits[stats_index] = -1.0e20f;
+      exp_sums[stats_index] = 0.f;
+    }
+    return;
+  }
+  const int part_tokens = part_end - part_start;
+
+  __shared__ float scores_shared[G][PARTITION_SIZE];
+  __shared__ int block_idx_shared[PARTITION_SIZE];
+  __shared__ int block_offset_shared[PARTITION_SIZE];
+
+  for (int i = threadIdx.x; i < part_tokens; i += blockDim.x) {
+    const int token_idx = part_start + i;
+    const int logical_block = token_idx / block_size;
+    block_idx_shared[i] =
+        block_table[static_cast<int64_t>(batch_idx) * max_num_blocks +
+                    logical_block];
+    block_offset_shared[i] = token_idx - logical_block * block_size;
+  }
+
+  // The group's queries, four dims a lane, in fp32 registers.
+  float q_reg[G][4];
+#pragma unroll
+  for (int g = 0; g < G; ++g) {
+    load_half4_as_float(
+        q + static_cast<int64_t>(batch_idx) * q_stride0 +
+            static_cast<int64_t>(kv_head_idx * G + g) * q_stride1 + dim,
+        q_reg[g]);
+  }
+  __syncthreads();
+
+  const bool upper16 = (lane & 16) != 0;
+  const bool upper8 = (lane & 8) != 0;
+  const bool upper4 = (lane & 4) != 0;
+  const int score_head = (lane >> 2) & (G - 1);
+  const int64_t k_head_base = static_cast<int64_t>(kv_head_idx) * k_head_stride;
+#pragma unroll 2
+  for (int t = warp; t < part_tokens; t += kWarpsPerBlock) {
+    float k[4];
+    load_half4_as_float(
+        k_cache + static_cast<int64_t>(block_idx_shared[t]) * k_block_stride +
+            static_cast<int64_t>(block_offset_shared[t]) * k_token_stride +
+            k_head_base + dim,
+        k);
+    float partial[G];
+#pragma unroll
+    for (int g = 0; g < G; ++g) {
+      float acc = q_reg[g][0] * k[0];
+      acc = fmaf(q_reg[g][1], k[1], acc);
+      acc = fmaf(q_reg[g][2], k[2], acc);
+      partial[g] = fmaf(q_reg[g][3], k[3], acc);
+    }
+    // Reduce-scatter over lane bits 4, 3 and 2: each round keeps half of
+    // the heads and adds the partner's partial sums for them.
+    float half_sums[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const float send = upper16 ? partial[j] : partial[j + 4];
+      const float keep = upper16 ? partial[j + 4] : partial[j];
+      half_sums[j] = keep + __shfl_xor_sync(0xffffffff, send, 16);
+    }
+    float quarter_sums[2];
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+      const float send = upper8 ? half_sums[j] : half_sums[j + 2];
+      const float keep = upper8 ? half_sums[j + 2] : half_sums[j];
+      quarter_sums[j] = keep + __shfl_xor_sync(0xffffffff, send, 8);
+    }
+    float score =
+        (upper4 ? quarter_sums[1] : quarter_sums[0]) +
+        __shfl_xor_sync(0xffffffff, upper4 ? quarter_sums[0] : quarter_sums[1],
+                        4);
+    score += __shfl_xor_sync(0xffffffff, score, 2);
+    score += __shfl_xor_sync(0xffffffff, score, 1);
+    if ((lane & 3) == 0) {
+      scores_shared[score_head][t] = score * softmax_scale;
+    }
+  }
+  __syncthreads();
+
+  float* head_scores = scores_shared[warp];
+  float part_max = -1.0e20f;
+  for (int i = lane; i < part_tokens; i += kWarpSize) {
+    part_max = fmaxf(part_max, head_scores[i]);
+  }
+  part_max = warp_allreduce_max(part_max);
+  float part_sum = 0.f;
+  for (int i = lane; i < part_tokens; i += kWarpSize) {
+    const float p = __expf(head_scores[i] - part_max);
+    head_scores[i] = p;
+    part_sum += p;
+  }
+  part_sum = warp_allreduce_sum(part_sum);
+  const float inv_part_sum = part_sum > 0.f ? 1.f / part_sum : 0.f;
+  __syncwarp();
+
+  float acc[4] = {0.f, 0.f, 0.f, 0.f};
+  const int64_t v_head_base = static_cast<int64_t>(kv_head_idx) * v_head_stride;
+#pragma unroll 8
+  for (int t = 0; t < part_tokens; ++t) {
+    float v[4];
+    load_half4_as_float(
+        v_cache + static_cast<int64_t>(block_idx_shared[t]) * v_block_stride +
+            static_cast<int64_t>(block_offset_shared[t]) * v_token_stride +
+            v_head_base + dim,
+        v);
+    const float p = head_scores[t];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      acc[j] = fmaf(p, v[j], acc[j]);
+    }
+  }
+  const __half2 lo =
+      __floats2half2_rn(acc[0] * inv_part_sum, acc[1] * inv_part_sum);
+  const __half2 hi =
+      __floats2half2_rn(acc[2] * inv_part_sum, acc[3] * inv_part_sum);
+  uint2 packed;
+  packed.x = *reinterpret_cast<const uint32_t*>(&lo);
+  packed.y = *reinterpret_cast<const uint32_t*>(&hi);
+  *reinterpret_cast<uint2*>(tmp_out + tmp_out_base + dim) = packed;
+  if (lane == 0) {
+    max_logits[stats_index] = part_max;
+    exp_sums[stats_index] = part_sum;
+  }
+}
+
+// The grouped kernel loads q, K, V and the partials as aligned half4 vectors.
+inline bool gqa8_d128_decode_aligned(const at::Tensor& t) {
+  if (reinterpret_cast<uintptr_t>(t.data_ptr()) % 8 != 0) {
+    return false;
+  }
+  for (int64_t i = 0; i + 1 < t.dim(); ++i) {
+    if (t.stride(i) % 4 != 0) {
+      return false;
+    }
+  }
+  return t.stride(-1) == 1;
+}
+
+template <int D, int PARTITION_SIZE, int SEQ_LEN_ROUTE, typename PARTIAL_T>
+bool gqa8_d128_decode_eligible(const at::Tensor& q, const at::Tensor& k_cache,
+                               const at::Tensor& v_cache,
+                               const at::Tensor& tmp_out, bool use_anchored,
+                               const float* sinks) {
+  if constexpr (D != kGqaDecodeHeadDim || !std::is_same_v<PARTIAL_T, __half> ||
+                SEQ_LEN_ROUTE != kXQARouteAllSeqLens) {
+    return false;
+  } else {
+    // Contained to layers with learned sinks (the Flint route); sink-free
+    // layers keep the per-head kernel and its validated numerics.
+    return sinks != nullptr && !use_anchored &&
+           q.size(1) == kGqaDecodeGroup * k_cache.size(2) &&
+           gqa8_d128_decode_aligned(q) && gqa8_d128_decode_aligned(k_cache) &&
+           gqa8_d128_decode_aligned(v_cache) &&
+           gqa8_d128_decode_aligned(tmp_out);
+  }
+}
+
 template <int D, int PARTITION_SIZE, int KV_DTYPE,
           int SEQ_LEN_ROUTE = kXQARouteAllSeqLens, typename PARTIAL_T = __half>
 void launch_flash_attention_decode_paged(
@@ -3605,7 +3873,25 @@ void launch_flash_attention_decode_paged(
             route_seq_len_final, anchor_lens, anchored_window);
   };
   if constexpr (KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP16) {
-    if (use_anchored) {
+    if (gqa8_d128_decode_eligible<D, PARTITION_SIZE, SEQ_LEN_ROUTE, PARTIAL_T>(
+            q, k_cache, v_cache, tmp_out, use_anchored, sinks)) {
+      const dim3 group_grid(batch_size, num_heads_kv, max_num_partitions);
+      flash_attention_decode_gqa8_d128_partition_kernel<PARTITION_SIZE>
+          <<<group_grid, block, 0, stream>>>(
+              reinterpret_cast<const __half*>(q.data_ptr<at::Half>()),
+              reinterpret_cast<const __half*>(k_cache.data_ptr<at::Half>()),
+              reinterpret_cast<const __half*>(v_cache.data_ptr<at::Half>()),
+              reinterpret_cast<__half*>(tmp_out.data_ptr()),
+              max_logits.data_ptr<float>(), exp_sums.data_ptr<float>(),
+              block_table.data_ptr<int>(), seq_lens.data_ptr<int>(),
+              active_num_partitions.data_ptr<int>(), batch_size, max_num_blocks,
+              max_num_partitions, num_heads_kv, block_size, q.stride(0),
+              q.stride(1), tmp_out.stride(0), tmp_out.stride(1),
+              tmp_out.stride(2), max_logits.stride(0), max_logits.stride(1),
+              k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
+              v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),
+              softmax_scale, window_size_left, window_size_right);
+    } else if (use_anchored) {
       launch_partition(std::true_type{}, std::false_type{});
     } else {
       launch_partition(std::false_type{}, std::false_type{});

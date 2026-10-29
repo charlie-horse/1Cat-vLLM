@@ -287,7 +287,12 @@ def test_decode_sinks_expanded_verifier_rows(sm70, window, heads):
 @WINDOWS
 @torch.inference_mode()
 def test_decode_sinks_none_is_bit_identical(sm70, window):
-    """``sinks=None`` is the sink-free kernel; -inf sinks add an exact zero."""
+    """``sinks=None`` is the sink-free kernel; -inf sinks add an exact zero.
+
+    With sinks, GQA 8:1 D128 layers take the grouped partition kernel, whose
+    fp32 sums run in another order than the per-head kernel's, so -inf sinks
+    match the sink-free output to rounding rather than bit for bit.
+    """
     device, interface = sm70
     seq_lens = [100, 600, 8192]
     k_cache, v_cache, block_table = _paged_kv(seq_lens, 4, 16, device, seed=31)
@@ -303,7 +308,46 @@ def test_decode_sinks_none_is_bit_identical(sm70, window):
         interface, q, k_cache, v_cache, block_table, lens, window, sinks=neg_inf, **kw
     )
     assert torch.equal(none, plain)
-    assert torch.equal(masked, plain)
+    torch.testing.assert_close(masked, plain, rtol=GROUPED_RTOL, atol=GROUPED_ATOL)
+
+
+# The grouped kernel against the per-head kernel: both round partials to
+# fp16, so they agree to a couple of fp16 ulps.
+GROUPED_ATOL = 2e-3
+GROUPED_RTOL = 1e-2
+
+
+@WINDOWS
+@HEADS
+@pytest.mark.parametrize("partition_size", [256, 512, 1024])
+@pytest.mark.parametrize(
+    "seq_lens",
+    [[1], [255, 256, 257], [513, 3000, 70], [8192]],
+    ids=["one", "edges", "mixed", "long"],
+)
+@torch.inference_mode()
+def test_decode_sinks_grouped_kernel_matches_per_head_kernel(
+    sm70, window, heads, partition_size, seq_lens
+):
+    """GQA 8:1 D128 sink layers run the grouped partition kernel.
+
+    A sink of -1e4 adds an exact zero to every denominator, so the grouped
+    output must match the per-head kernel's sink-free output.
+    """
+    device, interface = sm70
+    num_heads, num_kv_heads = heads
+    k_cache, v_cache, block_table = _paged_kv(
+        seq_lens, num_kv_heads, 16, device, seed=81 + partition_size
+    )
+    q = _query(len(seq_lens), num_heads, device, seed=82)
+    lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+    kw = {"max_seq_len_hint": max(seq_lens), "partition_size_hint": partition_size}
+    per_head = _decode(interface, q, k_cache, v_cache, block_table, lens, window, **kw)
+    silent = torch.full((num_heads,), -1.0e4, dtype=torch.float32, device=device)
+    grouped = _decode(
+        interface, q, k_cache, v_cache, block_table, lens, window, sinks=silent, **kw
+    )
+    torch.testing.assert_close(grouped, per_head, rtol=GROUPED_RTOL, atol=GROUPED_ATOL)
 
 
 @WINDOWS
