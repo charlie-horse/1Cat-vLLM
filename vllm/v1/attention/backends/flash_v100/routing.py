@@ -844,6 +844,11 @@ def _decode_active_trace_enabled() -> bool:
     return _config.trace().flash_v100.value("trace_decode_active")
 
 
+def decode_active_trace_enabled() -> bool:
+    """Whether decode partition activity is traced, for callers that bind it."""
+    return _decode_active_trace_enabled()
+
+
 def _decode_active_value(active_num_partitions: object) -> int | None:
     if not isinstance(active_num_partitions, torch.Tensor):
         return None

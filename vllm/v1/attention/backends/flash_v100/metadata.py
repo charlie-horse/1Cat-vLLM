@@ -105,10 +105,17 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         return SpecMetadataState.model_state_kwargs(metadata, id(self))
 
     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
+    # Bound once in __init__ (None: resolve per call). Metadata is built
+    # outside a forward context, where these reads re-resolve the standalone
+    # Flash-V100 policy on every call: per KV-cache group and decode step.
+    _decode_dynamic_partitions: bool | None = None
+    _trace_decode_active: bool | None = None
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._graph_policy = graph_policy(self.vllm_config)
+        self._decode_dynamic_partitions = _routing.decode_dynamic_partitions_enabled()
+        self._trace_decode_active = _routing.decode_active_trace_enabled()
         spec_config = getattr(self.vllm_config, "speculative_config", None)
         cache_config = getattr(self.vllm_config, "cache_config", None)
         model_config = self.vllm_config.model_config
@@ -351,7 +358,10 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
     ) -> None:
         flash_metadata = as_flash_v100_metadata(attn_metadata)
         flash_metadata.flash_v100_decode_active_num_partitions = None
-        if not _routing.decode_dynamic_partitions_enabled():
+        dynamic = self._decode_dynamic_partitions
+        if dynamic is None:
+            dynamic = _routing.decode_dynamic_partitions_enabled()
+        if not dynamic:
             return
 
         max_seq_len_hint = getattr(
@@ -380,6 +390,8 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         active_num_partitions = self._ensure_decode_active_num_partitions()
         active_num_partitions.fill_(active)
         flash_metadata.flash_v100_decode_active_num_partitions = active_num_partitions
+        if self._trace_decode_active is False:
+            return
         _routing.trace_decode_active_metadata(
             stage=stage,
             max_seq_len_hint=int(max_seq_len_hint),
