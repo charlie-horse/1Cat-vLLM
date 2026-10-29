@@ -61,12 +61,6 @@
     "GIT_REPO_CHECK": {
       "default": "0"
     },
-    "VLLM_MAX_SIZE_MB": {
-      "default": "500"
-    },
-    "RUN_WHEEL_CHECK": {
-      "default": "true"
-    },
     "FLASHINFER_VERSION": {
       "default": "0.6.11.post2"
     },
