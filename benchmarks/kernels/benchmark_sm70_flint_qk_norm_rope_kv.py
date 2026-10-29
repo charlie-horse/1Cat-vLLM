@@ -114,18 +114,22 @@ def main():
                 for _ in range(3):
                     fn(rope)
                 torch.accelerator.synchronize()
+                # Capture only the work; timing events are recorded on the
+                # stream around each replay (events recorded inside a capture
+                # are not usable for elapsed_time).
                 graph = torch.cuda.CUDAGraph()
-                begin = torch.cuda.Event(enable_timing=True)
-                end = torch.cuda.Event(enable_timing=True)
                 with torch.cuda.graph(graph):
-                    eviction.fill_(1)
-                    begin.record()
                     for _ in range(args.layers):
                         fn(rope)
-                    end.record()
+                torch.accelerator.synchronize()
+                begin = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
                 samples = []
                 for i in range(args.replays + 5):
+                    eviction.fill_(1)  # Cold L2, outside the timed span.
+                    begin.record()
                     graph.replay()
+                    end.record()
                     end.synchronize()
                     if i >= 5:
                         samples.append(begin.elapsed_time(end) * 1000 / args.layers)
