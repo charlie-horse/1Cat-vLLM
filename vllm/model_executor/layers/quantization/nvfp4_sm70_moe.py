@@ -117,6 +117,16 @@ _QWEN38_DYNAMIC_QPN_BATCH_W13_SPLIT_K: Final = {
     16: 1,
 }
 _QWEN38_QPN_BATCH_FUSED_W13_TOKENS: Final = frozenset((4, 8, 16))
+# Two-kernel M<=2 routed-expert decode. Local contract (experts, hidden,
+# local intermediate, top-k) of the native instance: Flint at TP2. The split-K
+# workspace sizes match nvfp4_moe_decode_qpn_sm70.cu.
+_DECODE_QPN_CONTRACTS: Final = frozenset({(256, 2048, 256, 6)})
+_DECODE_QPN_MAX_TOKENS: Final = 2
+_DECODE_QPN_PARTIALS: Final = 98304
+_DECODE_QPN_COUNTERS: Final = 96
+# The decode kernels form prepared_scale * 2^(14 - shift) in FP16.
+_FP16_MAX: Final = 65504.0
+_DECODE_QPN_MAX_SHIFT: Final = 14
 
 
 def _raw_scales_match_prepared(
@@ -163,6 +173,116 @@ def _use_qwen38_qpn_m1_decode(
         and int(layer.sm70_nvfp4_hidden_size) == 2560
         and int(layer.sm70_nvfp4_intermediate_size) == 160
         and int(layer.sm70_nvfp4_top_k) == 10
+    )
+
+
+def _decode_qpn_scale_shift(scales: torch.Tensor) -> int | None:
+    """Power-of-two pre-shift that keeps the decode scale product finite.
+
+    The decode kernels expand E2M1 codes as code * 2^-14 and multiply by the
+    prepared FP16 scale times 2^(14 - shift); the FP32 accumulator is then
+    multiplied by 2^shift. Both factors are exact, so the weights stay
+    e2m1 * e4m3 * global. Returns None when no shift fits (non-finite or
+    out-of-range scales); the layer then keeps the TurboMind route.
+    """
+    peak = float(scales.detach().abs().amax().float())
+    if not peak < float("inf"):
+        return None
+    for shift in range(_DECODE_QPN_MAX_SHIFT + 1):
+        if peak * 2.0 ** (14 - shift) <= _FP16_MAX:
+            return shift
+    return None
+
+
+def _use_decode_qpn(
+    layer: RoutedExperts,
+    x: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> bool:
+    """Admit the two-kernel M<=2 decode on a layer prepared for it."""
+    tokens = x.shape[0]
+    top_k = int(layer.sm70_nvfp4_top_k)
+    return bool(
+        getattr(layer, "sm70_nvfp4_decode_qpn", False)
+        and 0 < tokens <= _DECODE_QPN_MAX_TOKENS
+        and x.is_contiguous()
+        and tuple(topk_ids.shape) == (tokens, top_k)
+        and topk_ids.dtype == torch.int32
+        and topk_ids.is_contiguous()
+        and topk_weights.is_contiguous()
+    )
+
+
+def _prepare_decode_qpn(
+    layer: RoutedExperts,
+    native_ops,
+    contract: tuple[int, int, int, int],
+    *,
+    supported: bool,
+) -> None:
+    """Admit the two-kernel M<=2 decode and give the layer its workspace.
+
+    The kernels read the TurboMind banks in place; the only additions are a
+    384 KiB split-K workspace and two scale shifts per layer.
+    """
+    layer.sm70_nvfp4_decode_qpn = False
+    layer.sm70_nvfp4_decode_w13_scale_shift = 0
+    layer.sm70_nvfp4_decode_w2_scale_shift = 0
+    policy = _nvfp4_policy(layer)
+    if not (
+        getattr(policy, "flint_qpn_decode", False)
+        and supported
+        and contract in _DECODE_QPN_CONTRACTS
+    ):
+        return
+    if not native_ops.has_nvfp4_moe_decode_dispatch():
+        if "flint_qpn_decode" in policy.explicit_fields:
+            raise RuntimeError(
+                "VLLM_SM70_FLINT_MOE_QPN_DECODE=1 requires the TurboMind "
+                "extension with nvfp4_moe_decode_w13_swiglu_sm70_out and "
+                "nvfp4_moe_decode_w2_reduce_sm70_out."
+            )
+        logger.warning_once(
+            "The SM70 NVFP4 M<=2 decode ops are absent from the loaded "
+            "extension; keeping the TurboMind decode routes."
+        )
+        return
+    w13_shift = _decode_qpn_scale_shift(layer.w13_tm_scales)
+    w2_shift = _decode_qpn_scale_shift(layer.w2_tm_scales)
+    if w13_shift is None or w2_shift is None:
+        logger.warning(
+            "SM70 NVFP4 M<=2 decode: a prepared expert scale is not finite "
+            "or exceeds the FP16 decode range even after a 2^%d pre-shift; "
+            "this layer keeps the TurboMind decode routes.",
+            _DECODE_QPN_MAX_SHIFT,
+        )
+        return
+    if w13_shift or w2_shift:
+        logger.info(
+            "SM70 NVFP4 M<=2 decode: prepared scales need FP16 headroom; "
+            "using exact power-of-two pre-shifts W13 2^%d, W2 2^%d.",
+            w13_shift,
+            w2_shift,
+        )
+    device = layer.w13_tm_weight.device
+    layer._nvfp4_decode_partials = torch.empty(
+        _DECODE_QPN_PARTIALS, dtype=torch.float32, device=device
+    )
+    # Arrival counters must start at zero; the kernel re-arms them.
+    layer._nvfp4_decode_counters = torch.zeros(
+        _DECODE_QPN_COUNTERS, dtype=torch.int32, device=device
+    )
+    layer.sm70_nvfp4_decode_w13_scale_shift = w13_shift
+    layer.sm70_nvfp4_decode_w2_scale_shift = w2_shift
+    layer.sm70_nvfp4_decode_qpn = True
+    logger.info_once(
+        "SM70 NVFP4 two-kernel M<=2 routed-expert decode enabled "
+        "(hidden=%d, local_intermediate=%d, experts=%d, top_k=%d).",
+        contract[1],
+        contract[2],
+        contract[0],
+        contract[3],
     )
 
 
@@ -1137,6 +1257,14 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             )
         layer.sm70_nvfp4_grouped_decode = grouped_requested
         layer.sm70_nvfp4_grouped_mtp5 = grouped_mtp5
+        _prepare_decode_qpn(
+            layer,
+            self.native_ops,
+            (num_experts, hidden, intermediate, layer.sm70_nvfp4_top_k),
+            supported=not raw_scale
+            and not fused_swiglu_prefill
+            and layer.swiglu_limit is None,
+        )
         if grouped_requested or grouped_mtp5:
             # Layer-owned metadata; W2 reuses sorted_output. No process-global
             # cache or additional activation buffer inside graph capture.
@@ -1290,6 +1418,11 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 grouped_mtp5,
             )
             return output
+        if _use_decode_qpn(layer, x, topk_weights, topk_ids):
+            plan = select_fp4_stage_plan(Stage.DECODE_QPN, Stage.DECODE_REDUCE)
+            return execute_fp4(
+                layer.sm70_fp4_codec, plan, buffers, x, topk_ids, topk_weights
+            )
         direct_single_token = num_tokens == 1
         direct_qpn_m1 = _use_qwen38_qpn_m1_decode(layer, x, topk_ids)
         direct_qpn_batch = _use_qwen38_qpn_batch_decode(layer, x, topk_ids)

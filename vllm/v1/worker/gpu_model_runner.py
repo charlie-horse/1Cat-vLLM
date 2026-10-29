@@ -600,21 +600,26 @@ def _maybe_dump_sm70_qwen_layer_graph_buffers(stage: str, *, diagnostics=None) -
 def _should_record_sm70_sample_hidden_ready_event(
     sample_hidden_states: torch.Tensor,
     cudagraph_mode: CUDAGraphMode,
+    vllm_config: VllmConfig | None = None,
 ) -> bool:
-    return (
-        sample_hidden_states.is_cuda
-        and cudagraph_mode == CUDAGraphMode.FULL
-        and bool(graph_policy().compile_graph)
-        and current_platform.is_device_capability(70)
-    )
+    if not (sample_hidden_states.is_cuda and cudagraph_mode == CUDAGraphMode.FULL):
+        return False
+    # Borrow the engine-resolved policy when the runner passes its config:
+    # graph_policy() alone resolves a standalone policy from the environment
+    # on every decode step outside a forward context.
+    policy = graph_policy(vllm_config) if vllm_config is not None else None
+    if policy is None:
+        policy = graph_policy()
+    return bool(policy.compile_graph) and current_platform.is_device_capability(70)
 
 
 def _record_sm70_sample_hidden_ready_event(
     sample_hidden_states: torch.Tensor,
     cudagraph_mode: CUDAGraphMode,
+    vllm_config: VllmConfig | None = None,
 ) -> torch.cuda.Event | None:
     if not _should_record_sm70_sample_hidden_ready_event(
-        sample_hidden_states, cudagraph_mode
+        sample_hidden_states, cudagraph_mode, vllm_config
     ):
         return None
     event = torch.cuda.Event()
@@ -8850,7 +8855,7 @@ class GPUModelRunner(
             trace_postprocess_ms = (time.perf_counter() - trace_postprocess_t0) * 1000.0
 
         sample_hidden_ready_event = _record_sm70_sample_hidden_ready_event(
-            sample_hidden_states, cudagraph_mode
+            sample_hidden_states, cudagraph_mode, self.vllm_config
         )
         self._sm70_mtp_runner_profile_pending = (
             {

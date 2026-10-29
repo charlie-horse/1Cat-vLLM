@@ -237,3 +237,59 @@ def test_attention_diagnostic_budgets_and_output_do_not_cross_engines(tmp_path):
     for path in paths:
         with open(path) as stream:
             assert json.load(stream) == {"equal": True}
+
+
+def test_smallq_metadata_borrows_builder_policy_outside_current_config(monkeypatch):
+    """Decode builders run outside a forward context and current config; the
+    small-query getter must use the builder's engine policy, not resolve a
+    standalone policy from the environment on every step."""
+    from vllm.config import execution_policy
+    from vllm.v1.attention.backends.flash_v100.spec import verify_metadata
+
+    policy = FlashV100Policy(smallq_max_q=7)
+    policy.resolve()
+    builder = SimpleNamespace(
+        vllm_config=SimpleNamespace(attention_config=SimpleNamespace(flash_v100=policy))
+    )
+    monkeypatch.setattr(
+        execution_policy,
+        "_standalone_policy",
+        lambda cls: pytest.fail("standalone policy resolved on the hot path"),
+    )
+    monkeypatch.setattr("os.getenv", lambda *a: pytest.fail("read environment"))
+    assert verify_metadata.configured_smallq_max_query_len(builder) == 7
+
+
+def test_smallq_metadata_falls_back_without_builder_policy(monkeypatch):
+    from vllm.config import set_current_vllm_config
+    from vllm.v1.attention.backends.flash_v100.spec import verify_metadata
+
+    policy = FlashV100Policy(smallq_max_q=9)
+    policy.resolve()
+    cfg = SimpleNamespace(attention_config=SimpleNamespace(flash_v100=policy))
+    builder = SimpleNamespace(vllm_config=SimpleNamespace())
+    with set_current_vllm_config(cfg):
+        assert verify_metadata.configured_smallq_max_query_len(builder) == 9
+
+
+@pytest.mark.parametrize("compile_graph", [True, False])
+def test_sample_ready_event_borrows_runner_graph_policy(monkeypatch, compile_graph):
+    from vllm.config import CUDAGraphMode, execution_policy
+    from vllm.v1.worker import gpu_model_runner
+
+    graph = GraphPolicy(compile_graph=compile_graph)
+    cfg = SimpleNamespace(compilation_config=SimpleNamespace(runtime=graph))
+    monkeypatch.setattr(
+        execution_policy,
+        "_standalone_policy",
+        lambda cls: pytest.fail("standalone policy resolved on the hot path"),
+    )
+    monkeypatch.setattr(
+        gpu_model_runner.current_platform,
+        "is_device_capability",
+        lambda capability: capability == 70,
+    )
+    hidden = SimpleNamespace(is_cuda=True)
+    should_record = gpu_model_runner._should_record_sm70_sample_hidden_ready_event
+    assert should_record(hidden, CUDAGraphMode.FULL, cfg) is compile_graph
+    assert should_record(hidden, CUDAGraphMode.PIECEWISE, cfg) is False

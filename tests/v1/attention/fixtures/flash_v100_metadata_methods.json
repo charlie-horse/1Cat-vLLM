@@ -1,7 +1,7 @@
 {
   "base_sha": "fb6b12c5b8013ec43b5c34e0135857f3b0fb74e7",
   "methods": {
-    "_configured_smallq_max_query_len": "6f5ece5518345ec90d321dbde09c5e4fb51eb77f088c4a508025e147dc29af4e",
+    "_configured_smallq_max_query_len": "baad04e42b9c123d0d1e029c91d31714dddf10a08df90e989678a24355c44390",
     "_configured_smallq_max_model_len": "4c1b52d387a5a06e6f79141068f535e8c70a7551ecc2392075ef2f02dd420333",
     "_smallq_buffer_token_capacity": "5cd843820fa4d846dd0bdd92c4e3ebc940b7bffc0e2617cba3b1b0ad099249ab",
     "_ensure_smallq_decode_buffers": "75c1bc7d1f99aec92c560a75128629a6cf8643b2e456f38f0248197d88479fc5",
@@ -17,7 +17,7 @@
     "build": "cf6ed8f1cd8fd8c379f7101e115bdce95c47ae0abd16742400f4f478a61e247d"
   },
   "policy_migrations": {
-    "_configured_smallq_max_query_len": "C: attention_config.flash_v100.smallq_max_q; pre-existing typed getter, unchanged in D4",
+    "_configured_smallq_max_query_len": "C: attention_config.flash_v100.smallq_max_q; borrows the builder vllm_config policy (no per-step standalone resolve)",
     "_configured_smallq_max_model_len": "D4: attention_config.flash_v100.options.smallq_decode_max_model_len",
     "behavior_test": "tests/config/test_flash_v100_lifecycle.py::test_smallq_metadata_uses_initialized_policy_after_environment_change"
   }

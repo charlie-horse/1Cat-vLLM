@@ -360,6 +360,13 @@ void nvfp4_gemm_sm70_out(torch::Tensor out, torch::Tensor _in_feats,
                          int64_t group_size, int64_t k_ld, int64_t q_ld,
                          bool gated_silu);
 
+// M <= 2: NVFP4 GEMV on the TurboMind codes and FP16 scales; larger M (or an
+// uncovered shape) runs nvfp4_gemm_sm70_out on the same operands.
+void nvfp4_tm_gemv_dispatch_sm70_out(torch::Tensor out, torch::Tensor input,
+                                     torch::Tensor weight, torch::Tensor scales,
+                                     int64_t group_size, int64_t k_ld,
+                                     int64_t q_ld, int64_t scale_shift);
+
 void nvfp4_gemm_sm70_prescaled_out(torch::Tensor out, torch::Tensor input,
                                    torch::Tensor weight, torch::Tensor scales,
                                    int64_t group_size, int64_t k_ld,
@@ -718,6 +725,18 @@ void nvfp4_moe_qpn_mtp5_sm70_out(torch::Tensor out, torch::Tensor input,
                                  torch::Tensor weights, torch::Tensor scales,
                                  torch::Tensor expert_ids, bool broadcast_input,
                                  int64_t split_k);
+
+void nvfp4_moe_decode_w13_swiglu_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor weights,
+    torch::Tensor scales, torch::Tensor expert_ids, torch::Tensor partials,
+    torch::Tensor counters, int64_t scale_shift);
+
+void nvfp4_moe_decode_w2_reduce_sm70_out(torch::Tensor out, torch::Tensor input,
+                                         torch::Tensor weights,
+                                         torch::Tensor scales,
+                                         torch::Tensor expert_ids,
+                                         torch::Tensor topk_weights,
+                                         int64_t scale_shift);
 
 void nvfp4_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
                                     torch::Tensor expert_offsets,

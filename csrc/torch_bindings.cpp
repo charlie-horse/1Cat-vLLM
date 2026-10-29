@@ -951,6 +951,15 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("nvfp4_gemm_sm70_out", torch::kCUDA,
            vllm::sm70::with_policy(&nvfp4_gemm_sm70_out));
 
+  // Single-token decode of ModelOpt W4A16 dense layers: same operands and
+  // leading arguments as nvfp4_gemm_sm70_out, M branch inside the operator.
+  ops.def(
+      "nvfp4_tm_gemv_dispatch_sm70_out(Tensor(a!) out, Tensor input, "
+      "Tensor weight, Tensor scales, int group_size, int k_ld, int q_ld, "
+      "int scale_shift=14, str? native_policy=None ) -> ()");
+  ops.impl("nvfp4_tm_gemv_dispatch_sm70_out", torch::kCUDA,
+           vllm::sm70::with_policy(&nvfp4_tm_gemv_dispatch_sm70_out));
+
   ops.def(
       "nvfp4_gemm_sm70_prescaled_out(Tensor(a!) out, Tensor input, "
       "Tensor weight, Tensor scales, int group_size, int k_ld, int q_ld, "
@@ -1450,6 +1459,23 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "native_policy=None ) -> ()");
   ops.impl("nvfp4_glm53_moe_q8_qpn_sm70_out", torch::kCUDA,
            vllm::sm70::with_policy(&nvfp4_glm53_moe_q8_qpn_sm70_out));
+
+  // Flint TP2 M<=2 routed-expert decode (W13+SwiGLU, then W2+reduce).
+  ops.def(
+      "nvfp4_moe_decode_w13_swiglu_sm70_out("
+      "Tensor(a!) out, Tensor input, Tensor weights, Tensor scales, "
+      "Tensor expert_ids, Tensor(b!) partials, Tensor(c!) counters, "
+      "int scale_shift, str? native_policy=None ) -> ()");
+  ops.impl("nvfp4_moe_decode_w13_swiglu_sm70_out", torch::kCUDA,
+           vllm::sm70::with_policy(&nvfp4_moe_decode_w13_swiglu_sm70_out));
+
+  ops.def(
+      "nvfp4_moe_decode_w2_reduce_sm70_out("
+      "Tensor(a!) out, Tensor input, Tensor weights, Tensor scales, "
+      "Tensor expert_ids, Tensor topk_weights, int scale_shift, str? "
+      "native_policy=None ) -> ()");
+  ops.impl("nvfp4_moe_decode_w2_reduce_sm70_out", torch::kCUDA,
+           vllm::sm70::with_policy(&nvfp4_moe_decode_w2_reduce_sm70_out));
 
   ops.def(
       "nvfp4_moe_dense_stage_sm70_out("

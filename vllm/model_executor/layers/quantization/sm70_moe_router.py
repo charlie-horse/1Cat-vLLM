@@ -27,6 +27,8 @@ class Sm70MoeStageRoute(str, Enum):
     PREPARE_W13 = "prepare_w13"
     GLM_QPN = "glm_qpn"
     GROUPED_BATCH_REDUCE = "grouped_batch_reduce"
+    DECODE_QPN = "decode_qpn"
+    DECODE_REDUCE = "decode_reduce"
 
 
 @dataclass(frozen=True)

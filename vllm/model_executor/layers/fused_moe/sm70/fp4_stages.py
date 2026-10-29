@@ -58,7 +58,14 @@ def execute_fp4(
     route_ids = (
         topk_ids.view(-1)
         if plan.w13.value
-        in {"qpn", "fused_qpn", "fused_batch_qpn", "glm_qpn", "active_grouped"}
+        in {
+            "qpn",
+            "fused_qpn",
+            "fused_batch_qpn",
+            "glm_qpn",
+            "active_grouped",
+            "decode_qpn",
+        }
         else None
     )
     codec.gemm_w13(

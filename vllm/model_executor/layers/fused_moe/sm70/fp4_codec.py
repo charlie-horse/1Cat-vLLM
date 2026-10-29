@@ -135,6 +135,16 @@ class Fp4MoECodec:
         elif mode == "fused_batch_qpn":
             op = self._op("w13", mode)
             op(buffers["intermediate"], x, *self._bank("w13"), ids, plan.interleaved)
+        elif mode == "decode_qpn":
+            self._op("w13", mode)(
+                buffers["intermediate"],
+                x,
+                *self._bank("w13"),
+                ids,
+                self.weights._nvfp4_decode_partials,
+                self.weights._nvfp4_decode_counters,
+                self.dimensions.decode_w13_scale_shift,
+            )
         elif mode == "prepare_w13":
             self._op("w13", "prepare_w13")(
                 out,
@@ -219,6 +229,15 @@ class Fp4MoECodec:
         elif mode == "batch_reduce":
             op = self._op("w2", mode)
             op(buffers["output"], x, *self._bank("w2"), ids, topk_weights)
+        elif mode == "decode_reduce":
+            self._op("w2", mode)(
+                buffers["output"],
+                x,
+                *self._bank("w2"),
+                ids,
+                topk_weights,
+                self.dimensions.decode_w2_scale_shift,
+            )
         else:
             self._expand("w2", False)
             self._op("w2", "dense")(

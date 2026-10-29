@@ -342,6 +342,87 @@ def nvfp4_moe_qpn_w2_reduce_sm70_out(
     )
 
 
+def nvfp4_moe_decode_w13_swiglu_sm70_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    weights: torch.Tensor,
+    scales: torch.Tensor,
+    expert_ids: torch.Tensor,
+    partials: torch.Tensor,
+    counters: torch.Tensor,
+    scale_shift: int,
+    native_policy: tuple[str, ...] = (),
+) -> None:
+    call_native(
+        _op("nvfp4_moe_decode_w13_swiglu_sm70_out"),
+        native_policy,
+        out,
+        input,
+        weights,
+        scales,
+        expert_ids,
+        partials,
+        counters,
+        scale_shift,
+    )
+
+
+def nvfp4_moe_decode_w2_reduce_sm70_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    weights: torch.Tensor,
+    scales: torch.Tensor,
+    expert_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    scale_shift: int,
+    native_policy: tuple[str, ...] = (),
+) -> None:
+    call_native(
+        _op("nvfp4_moe_decode_w2_reduce_sm70_out"),
+        native_policy,
+        out,
+        input,
+        weights,
+        scales,
+        expert_ids,
+        topk_weights,
+        scale_shift,
+    )
+
+
+if hasattr(torch.ops._C, "nvfp4_moe_decode_w13_swiglu_sm70_out"):
+
+    @register_fake("_C::nvfp4_moe_decode_w13_swiglu_sm70_out")
+    def _nvfp4_moe_decode_w13_swiglu_sm70_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        weights: torch.Tensor,
+        scales: torch.Tensor,
+        expert_ids: torch.Tensor,
+        partials: torch.Tensor,
+        counters: torch.Tensor,
+        scale_shift: int,
+        native_policy: str | None = None,
+    ) -> None:
+        return None
+
+
+if hasattr(torch.ops._C, "nvfp4_moe_decode_w2_reduce_sm70_out"):
+
+    @register_fake("_C::nvfp4_moe_decode_w2_reduce_sm70_out")
+    def _nvfp4_moe_decode_w2_reduce_sm70_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        weights: torch.Tensor,
+        scales: torch.Tensor,
+        expert_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        scale_shift: int,
+        native_policy: str | None = None,
+    ) -> None:
+        return None
+
+
 if hasattr(torch.ops._C, "nvfp4_moe_qpn_w2_reduce_sm70_out"):
 
     @register_fake("_C::nvfp4_moe_qpn_w2_reduce_sm70_out")

@@ -1802,6 +1802,49 @@ if hasattr(torch.ops._C, "nvfp4_gemm_sm70_out"):
         return None
 
 
+def nvfp4_tm_gemv_dispatch_sm70_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int,
+    k_ld: int,
+    q_ld: int,
+    scale_shift: int = 14,
+    native_policy: tuple[str, ...] = (),
+) -> None:
+    """M <= 2 GEMV on the TurboMind NVFP4 operands, TurboMind otherwise."""
+    call_native(
+        _op("nvfp4_tm_gemv_dispatch_sm70_out"),
+        native_policy,
+        out,
+        input,
+        qweight,
+        scales,
+        group_size,
+        k_ld,
+        q_ld,
+        scale_shift,
+    )
+
+
+if hasattr(torch.ops._C, "nvfp4_tm_gemv_dispatch_sm70_out"):
+
+    @register_fake("_C::nvfp4_tm_gemv_dispatch_sm70_out")
+    def _nvfp4_tm_gemv_dispatch_sm70_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        qweight: torch.Tensor,
+        scales: torch.Tensor,
+        group_size: int,
+        k_ld: int,
+        q_ld: int,
+        scale_shift: int = 14,
+        native_policy: tuple[str, ...] = (),
+    ) -> None:
+        return None
+
+
 def nvfp4_gemm_sm70_prescaled_out(
     out: torch.Tensor,
     input: torch.Tensor,

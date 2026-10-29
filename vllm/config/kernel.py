@@ -59,6 +59,7 @@ SM70_LOADER_ALIASES = {
         "enabled": "VLLM_SM70_NVFP4_TURBOMIND",
         "gated_silu": "VLLM_SM70_NVFP4_DENSE_GATED_SILU",
         "down_scale_code": "VLLM_SM70_NVFP4_QPN4_DOWN_SCALE_CODE",
+        "modelopt_gemv": "VLLM_SM70_MODELOPT_NVFP4_GEMV",
     },
 }
 
@@ -246,6 +247,8 @@ class Sm70NvFp4Config(Sm70LinearCompatibility):
     """Retain the qualified dense gate/up epilogue."""
     down_scale_code: bool | None = None
     """Retain the experimental down-projection scale-code layout."""
+    modelopt_gemv: bool | None = None
+    """Single-token GEMV for the Flint ModelOpt W4A16 dense shapes."""
     active: bool = Field(default=False, init=False)
     """A loaded provider uses this format; inactive options do not salt graphs."""
     sources: dict[str, str] = Field(default_factory=dict, init=False)

@@ -351,6 +351,7 @@ if TYPE_CHECKING:
     VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES: bool = True
     VLLM_SM70_NVFP4_QWEN38_TP4_M1_FAST_SELECTOR: bool = True
     VLLM_SM70_NVFP4_QWEN38_MOE_QPN_M1_DECODE: bool = True
+    VLLM_SM70_FLINT_MOE_QPN_DECODE: bool = True
     VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_DECODE: bool = True
     VLLM_SM70_NVFP4_QWEN38_MOE_QPN_DYNAMIC_DECODE: bool = False
     VLLM_SM70_NVFP4_MOE_GROUPED_DECODE: bool = False
@@ -562,6 +563,7 @@ if TYPE_CHECKING:
     VLLM_SM70_NVFP4_DENSE_GATED_SILU: bool = True
     VLLM_SM70_NVFP4_QPN4: bool = True
     VLLM_SM70_NVFP4_QPN4_DOWN_SCALE_CODE: bool = False
+    VLLM_SM70_MODELOPT_NVFP4_GEMV: bool = True
     VLLM_SM70_MXFP4_TURBOMIND: bool = True
     VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_B1: bool = False
     VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_MAX_TOKENS: int = 8
@@ -5064,6 +5066,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=("TurboMind NVFP4",),
         user_visible=False,
     ),
+    # Two-kernel routed-expert decode for Flint NVFP4 at TP2 and M<=2 tokens
+    # (W13+SwiGLU, then W2+top-k reduce, routed on device from the TurboMind
+    # banks). "0" keeps the TurboMind single-token and compact routes.
+    "VLLM_SM70_FLINT_MOE_QPN_DECODE": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_FLINT_MOE_QPN_DECODE", "1"))),
+        description=(
+            "Two-kernel routed-expert decode for Flint NVFP4 at TP2 and one or "
+            "two tokens: W13 with fused SwiGLU, then W2 with the fused top-k "
+            "weighted reduction, both reading the TurboMind-packed expert "
+            "banks and routing on device. FP32 accumulation, FP16 boundaries "
+            "and deterministic reductions. Set to 0 to keep the TurboMind "
+            "routes."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind NVFP4",),
+        user_visible=False,
+    ),
     # Direct Qwen3.8 expert route for CUDA Graph local widths 2, 4, 8, and 16. It
     # retains native NVFP4 weights, FP16 activations, and FP32 accumulation
     # while skipping expert sort and input expansion. Exact shape/capability
@@ -8574,6 +8596,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("Qpn4NvFp4LinearKernel",),
+        user_visible=False,
+    ),
+    # Single-token GEMV for the Flint ModelOpt W4A16 dense layers. It reads
+    # the resident TurboMind codes and FP16 scales, so it adds no memory.
+    # Set to 0 to run TurboMind for every batch size.
+    "VLLM_SM70_MODELOPT_NVFP4_GEMV": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_MODELOPT_NVFP4_GEMV", "1"))),
+        description=(
+            "Single-token (M <= 2) GEMV for the Flint ModelOpt W4A16 NVFP4 "
+            "dense layers on exact SM70. It reads the resident TurboMind codes "
+            "and FP16 scales, so it adds no memory. Set to 0 to run TurboMind "
+            "for every batch size."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind NVFP4",),
         user_visible=False,
     ),
     # Exact no-MTP random sampler for the Qwen3.8 TP4 batch-one contract.
