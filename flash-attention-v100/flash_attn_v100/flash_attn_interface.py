@@ -47,6 +47,9 @@ class _DecodeWorkspace:
     max_num_partitions: int
     captured: bool = False
     previous: "_DecodeWorkspace | None" = None
+    # int32 arrival counters of the single-launch sink decode, one per
+    # (row, head); zero between launches. Allocated on first use.
+    fused_counters: torch.Tensor | None = None
 
 
 @dataclass
@@ -116,6 +119,12 @@ def _decode_dynamic_partitions_enabled(*, _runtime=None) -> bool:
         if _runtime is not None
         else _legacy.dynamic_partitions()
     )
+
+
+def _sink_fused_decode_enabled(*, _runtime=None) -> bool:
+    if _runtime is not None:
+        return bool(getattr(_runtime.policy, "sink_fused_decode", True))
+    return _legacy.sink_fused_decode()
 
 
 def _xqa_staged_pv_enabled(*, _runtime=None) -> bool:
@@ -352,6 +361,7 @@ def _get_decode_workspace_for_plan(
     plan: _DecodePlan,
     active_num_partitions: torch.Tensor | None = None,
     partial_dtype: torch.dtype = torch.float16,
+    fused_counters: bool = False,
     _runtime=None,
 ):
     device_index = q.device.index if q.device.index is not None else -1
@@ -424,12 +434,23 @@ def _get_decode_workspace_for_plan(
     if active_num_partitions is None:
         workspace.active_num_partitions.fill_(plan.actual_num_partitions)
         active_num_partitions = workspace.active_num_partitions
-    return (
+    buffers = (
         workspace.tmp_out[:batch_capacity],
         workspace.max_logits[:batch_capacity],
         workspace.exp_sums[:batch_capacity],
         active_num_partitions,
     )
+    if not fused_counters:
+        return buffers
+    if workspace.fused_counters is None:
+        # Zeroed once; each fused launch leaves its counters at zero. Rows
+        # times query heads covers every (row, KV head) of any GQA ratio.
+        workspace.fused_counters = torch.zeros(
+            workspace.tmp_out.size(0) * workspace.tmp_out.size(1),
+            dtype=torch.int32,
+            device=q.device,
+        )
+    return (*buffers, workspace.fused_counters)
 
 
 def _get_xqa_staged_rescale_workspace(
@@ -1208,18 +1229,30 @@ def flash_attn_decode_paged(
         version = getattr(flash_attn_v100_cuda, "tp2_e4m3_scalar_fast_version", None)
         if not callable(version) or int(version()) < 3:
             raise RuntimeError("Rebuild Flash-V100 for E4M3 scalar fast revision 3")
-    tmp_out, max_logits, exp_sums, active_num_partitions = (
-        _get_decode_workspace_for_plan(
-            q,
-            batch_capacity=batch_capacity,
-            num_heads=num_heads,
-            head_dim=head_dim,
-            plan=plan,
-            active_num_partitions=active_num_partitions,
-            partial_dtype=torch.float32 if e4m3_fp32 else torch.float16,
-            _runtime=_runtime,
-        )
+    # Grouped GQA-8 D128 sink layers decode in one launch (partitions and the
+    # sink-aware reduction) when the extension has the fused entry point. The
+    # extension re-checks the shape and falls back to two launches.
+    fused = (
+        sinks is not None
+        and head_dim == 128
+        and q.shape[1] == 8 * k_cache.shape[2]
+        and anchor_lens is None
+        and not e4m3_fp32
+        and hasattr(native, "decode_paged_sinks_fused_fwd")
+        and _sink_fused_decode_enabled(_runtime=_runtime)
     )
+    workspace = _get_decode_workspace_for_plan(
+        q,
+        batch_capacity=batch_capacity,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        plan=plan,
+        active_num_partitions=active_num_partitions,
+        partial_dtype=torch.float32 if e4m3_fp32 else torch.float16,
+        fused_counters=fused,
+        _runtime=_runtime,
+    )
+    tmp_out, max_logits, exp_sums, active_num_partitions = workspace[:4]
 
     native_args = (
         q,
@@ -1245,6 +1278,8 @@ def flash_attn_decode_paged(
     )
     if sinks is None:
         return native.decode_paged_fwd(*native_args)
+    if fused:
+        return native.decode_paged_sinks_fused_fwd(*native_args, sinks, workspace[4])
     return native.decode_paged_sinks_fwd(*native_args, sinks)
 
 

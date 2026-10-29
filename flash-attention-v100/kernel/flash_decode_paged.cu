@@ -3964,6 +3964,417 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
   }
 }
 
+// Single-kernel grouped D128 decode with sinks: the partition kernel and the
+// cross-partition reducer above fused into one launch per layer.
+//
+// The two-kernel route launches one CTA per (sequence, KV head, partition)
+// over the whole captured envelope (1024 partitions at a 262K workspace), so
+// at short context almost every CTA exits at once, and the reducer is a
+// second launch whose latency chain sits behind the partition kernel. Here
+// the grid is (sequence, KV head, Z) with Z sized on the host to fill the
+// device once (independent of sequence lengths, so it is CUDA-graph safe),
+// and the in-window token range [lo, seq_len) is split on the device into
+// balanced chunks of at most MAX_CHUNK tokens:
+//   chunks  N = min(Z * ceil(len / (Z * MAX_CHUNK)), ceil(len / kMinChunk))
+//   CTAs    W = min(Z, N) work; CTA z takes chunks z, z + W, ...
+// A CTA combines its chunks online in fp32 registers and writes one partial
+// (fp16 normalised output, fp32 max and sum: the reducer's inputs). The last
+// CTA of the (sequence, KV head) to arrive, found with a device-scope atomic
+// counter, combines the W partials in index order (so the result does not
+// depend on which CTA arrives last), applies the sink exactly as
+// flash_attention_decode_gqa8_d128_reduce_kernel does, writes the output and
+// resets the counter for the next launch. With W == 1 (short windows on a
+// small grid) the CTA writes the output directly from registers.
+constexpr int kGqaFusedMaxChunk = 256;
+constexpr int kGqaFusedMinChunk = 64;
+constexpr int kGqaFusedMaxCtasPerHead = 256;
+
+template <int MAX_CHUNK>
+__global__ void __launch_bounds__(kThreadsPerBlock, 2)
+    flash_attention_decode_gqa8_d128_fused_kernel(
+        const __half* __restrict__ q, const __half* __restrict__ k_cache,
+        const __half* __restrict__ v_cache, __half* __restrict__ out,
+        __half* __restrict__ tmp_out, float* __restrict__ max_logits,
+        float* __restrict__ exp_sums, unsigned int* __restrict__ counters,
+        const int* __restrict__ block_table, const int* __restrict__ seq_lens,
+        const float* __restrict__ sinks, const int max_num_blocks,
+        const int num_heads_kv, const int block_size, const int64_t q_stride0,
+        const int64_t q_stride1, const int64_t out_stride0,
+        const int64_t out_stride1, const int64_t tmp_out_stride0,
+        const int64_t tmp_out_stride1, const int64_t tmp_out_stride2,
+        const int64_t stats_stride0, const int64_t stats_stride1,
+        const int64_t k_block_stride, const int64_t k_token_stride,
+        const int64_t k_head_stride, const int64_t v_block_stride,
+        const int64_t v_token_stride, const int64_t v_head_stride,
+        const float softmax_scale, const int window_size_left) {
+  constexpr int G = kGqaDecodeGroup;
+  constexpr int D = kGqaDecodeHeadDim;
+  static_assert(kWarpsPerBlock == G, "one warp per query head of the group");
+  static_assert(D == 4 * kWarpSize, "four dims per lane");
+  static_assert(MAX_CHUNK % kWarpsPerBlock == 0, "whole PV slices");
+  const int batch_idx = blockIdx.x;
+  const int kv_head_idx = blockIdx.y;
+  const int cta = blockIdx.z;
+  const int num_ctas = gridDim.z;
+  const int lane = threadIdx.x % kWarpSize;
+  const int warp = threadIdx.x / kWarpSize;
+  const int dim = 4 * lane;
+  // Softmax, PV output and the final reduction: this warp's query head.
+  const int head_idx = kv_head_idx * G + warp;
+  const int64_t out_base = static_cast<int64_t>(batch_idx) * out_stride0 +
+                           static_cast<int64_t>(head_idx) * out_stride1;
+
+  const int seq_len = seq_lens[batch_idx];
+  if (seq_len <= 0) {
+    // As the reducer: an empty row decodes to zeros.
+    if (cta == 0) {
+      *reinterpret_cast<uint2*>(out + out_base + dim) = make_uint2(0, 0);
+    }
+    return;
+  }
+  // Decode queries sit at seq_len - 1, so the right window never clips.
+  const int lo =
+      window_size_left >= 0 ? max(0, seq_len - 1 - window_size_left) : 0;
+  const int len = seq_len - lo;
+  const int span = num_ctas * MAX_CHUNK;
+  const int iters = (len + span - 1) / span;
+  const int num_chunks =
+      min(num_ctas * iters, (len + kGqaFusedMinChunk - 1) / kGqaFusedMinChunk);
+  const int active = min(num_ctas, num_chunks);
+  if (cta >= active) {
+    return;
+  }
+
+  // The group's scores during QK and softmax, then the warps' PV partials,
+  // then the last CTA's per-head (max, weight) staging.
+  constexpr int kScoreFloats = G * MAX_CHUNK;
+  constexpr int kPartialFloats = kWarpsPerBlock * G * D;
+  static_assert(kPartialFloats >= G * 2 * kGqaFusedMaxCtasPerHead,
+                "reduction staging fits the PV buffer");
+  __shared__ __align__(16) float
+      pv_shared[kScoreFloats > kPartialFloats ? kScoreFloats : kPartialFloats];
+  float (*scores_shared)[MAX_CHUNK] =
+      reinterpret_cast<float (*)[MAX_CHUNK]>(pv_shared);
+  __shared__ int block_idx_shared[MAX_CHUNK];
+  __shared__ int block_offset_shared[MAX_CHUNK];
+  __shared__ int is_last_shared;
+  // The group's queries, staged once: QK reloads them from shared memory for
+  // each chunk instead of holding 64 registers across PV (two CTAs per SM).
+  __shared__ __align__(16) __half q_shared[G * D];
+  for (int i = threadIdx.x; i < G * D / 8; i += blockDim.x) {
+    const int g = i / (D / 8);
+    const int d8 = 8 * (i % (D / 8));
+    *reinterpret_cast<uint4*>(q_shared + g * D + d8) =
+        *reinterpret_cast<const uint4*>(
+            q + static_cast<int64_t>(batch_idx) * q_stride0 +
+            static_cast<int64_t>(kv_head_idx * G + g) * q_stride1 + d8);
+  }
+
+  // Each half-warp owns one token at a time in QK; its 16 lanes hold eight
+  // dims each of the key row and of the group's eight queries.
+  const int pair_half = lane >> 4;
+  const int half_lane = lane & 15;
+  const int dim8 = 8 * half_lane;
+  const bool upper8 = (half_lane & 8) != 0;
+  const bool upper4 = (half_lane & 4) != 0;
+  const bool upper2 = (half_lane & 2) != 0;
+  const int score_head = (half_lane >> 1) & (G - 1);
+  const int64_t k_head_base = static_cast<int64_t>(kv_head_idx) * k_head_stride;
+  const int64_t v_head_base = static_cast<int64_t>(kv_head_idx) * v_head_stride;
+  const int64_t table_base = static_cast<int64_t>(batch_idx) * max_num_blocks;
+
+  // Running (max, sum, unnormalised output) of this warp's head over the
+  // CTA's chunks, four dims a lane.
+  float run_max = -1.0e20f;
+  float run_sum = 0.f;
+  float run_acc[4] = {0.f, 0.f, 0.f, 0.f};
+
+  for (int chunk = cta; chunk < num_chunks; chunk += active) {
+    const int chunk_start =
+        lo + static_cast<int>((static_cast<int64_t>(chunk) * len) / num_chunks);
+    const int chunk_end =
+        lo +
+        static_cast<int>((static_cast<int64_t>(chunk + 1) * len) / num_chunks);
+    const int n = chunk_end - chunk_start;  // 1..MAX_CHUNK
+    __syncthreads();  // the previous chunk's shared reads are done
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+      const int token_idx = chunk_start + i;
+      const int logical_block = token_idx / block_size;
+      block_idx_shared[i] = block_table[table_base + logical_block];
+      block_offset_shared[i] = token_idx - logical_block * block_size;
+    }
+    __syncthreads();
+
+    float q_reg[G][8];
+#pragma unroll
+    for (int g = 0; g < G; ++g) {
+      load_half8_as_float(q_shared + g * D + dim8, q_reg[g]);
+    }
+    // QK: token pairs keep both halves in the loop together for the shuffles.
+#pragma unroll 2
+    for (int pair = warp; 2 * pair < n; pair += kWarpsPerBlock) {
+      const int t = 2 * pair + pair_half;
+      const bool valid = t < n;
+      float k[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+      if (valid) {
+        load_half8_as_float(
+            k_cache +
+                static_cast<int64_t>(block_idx_shared[t]) * k_block_stride +
+                static_cast<int64_t>(block_offset_shared[t]) * k_token_stride +
+                k_head_base + dim8,
+            k);
+      }
+      float partial[G];
+#pragma unroll
+      for (int g = 0; g < G; ++g) {
+        float acc = q_reg[g][0] * k[0];
+#pragma unroll
+        for (int j = 1; j < 8; ++j) {
+          acc = fmaf(q_reg[g][j], k[j], acc);
+        }
+        partial[g] = acc;
+      }
+      float half_sums[4];
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const float send = upper8 ? partial[j] : partial[j + 4];
+        const float keep = upper8 ? partial[j + 4] : partial[j];
+        half_sums[j] = keep + __shfl_xor_sync(0xffffffff, send, 8);
+      }
+      float quarter_sums[2];
+#pragma unroll
+      for (int j = 0; j < 2; ++j) {
+        const float send = upper4 ? half_sums[j] : half_sums[j + 2];
+        const float keep = upper4 ? half_sums[j + 2] : half_sums[j];
+        quarter_sums[j] = keep + __shfl_xor_sync(0xffffffff, send, 4);
+      }
+      float score =
+          (upper2 ? quarter_sums[1] : quarter_sums[0]) +
+          __shfl_xor_sync(0xffffffff,
+                          upper2 ? quarter_sums[0] : quarter_sums[1], 2);
+      score += __shfl_xor_sync(0xffffffff, score, 1);
+      if (valid && (half_lane & 1) == 0) {
+        scores_shared[score_head][t] = score * softmax_scale;
+      }
+    }
+    __syncthreads();
+
+    float* head_scores = scores_shared[warp];
+    float part_max = -1.0e20f;
+    for (int i = lane; i < n; i += kWarpSize) {
+      part_max = fmaxf(part_max, head_scores[i]);
+    }
+    part_max = warp_allreduce_max(part_max);
+    float part_sum = 0.f;
+    for (int i = lane; i < n; i += kWarpSize) {
+      const float p = __expf(head_scores[i] - part_max);
+      head_scores[i] = p;
+      part_sum += p;
+    }
+    part_sum = warp_allreduce_sum(part_sum);
+    __syncthreads();
+
+    // PV: warp w accumulates all eight heads over its eighth of the chunk.
+    const int tokens_per_warp = (n + kWarpsPerBlock - 1) / kWarpsPerBlock;
+    const int t_begin = warp * tokens_per_warp;
+    const int t_end = min(t_begin + tokens_per_warp, n);
+    float acc[G][4];
+#pragma unroll
+    for (int g = 0; g < G; ++g) {
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        acc[g][j] = 0.f;
+      }
+    }
+#pragma unroll 4
+    for (int t = t_begin; t < t_end; ++t) {
+      float v[4];
+      load_half4_as_float(
+          v_cache + static_cast<int64_t>(block_idx_shared[t]) * v_block_stride +
+              static_cast<int64_t>(block_offset_shared[t]) * v_token_stride +
+              v_head_base + dim,
+          v);
+#pragma unroll
+      for (int g = 0; g < G; ++g) {
+        const float p = scores_shared[g][t];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          acc[g][j] = fmaf(p, v[j], acc[g][j]);
+        }
+      }
+    }
+    __syncthreads();             // every warp has read the probabilities
+    float* partial = pv_shared;  // [warp][head][dim]
+#pragma unroll
+    for (int g = 0; g < G; ++g) {
+      *reinterpret_cast<float4*>(partial + (warp * G + g) * D + dim) =
+          make_float4(acc[g][0], acc[g][1], acc[g][2], acc[g][3]);
+    }
+    __syncthreads();
+    float total[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+    for (int w = 0; w < kWarpsPerBlock; ++w) {
+      const float4 slice =
+          *reinterpret_cast<const float4*>(partial + (w * G + warp) * D + dim);
+      total[0] += slice.x;
+      total[1] += slice.y;
+      total[2] += slice.z;
+      total[3] += slice.w;
+    }
+    // Online combine (part_max and part_sum are uniform across the warp).
+    const float new_max = fmaxf(run_max, part_max);
+    const float run_scale = __expf(run_max - new_max);
+    const float part_scale = __expf(part_max - new_max);
+    run_sum = run_sum * run_scale + part_sum * part_scale;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      run_acc[j] = run_acc[j] * run_scale + total[j] * part_scale;
+    }
+    run_max = new_max;
+  }
+
+  const float sink = sinks[head_idx];
+  if (active == 1) {
+    // The whole window in one CTA: apply the sink and finish here.
+    const float global_max = fmaxf(run_max, sink);
+    const float weight = run_sum * __expf(run_max - global_max);
+    const float global_sum = weight + __expf(sink - global_max);
+    const float scale = global_sum > 0.f && run_sum > 0.f
+                            ? weight / (run_sum * global_sum)
+                            : 0.f;
+    const __half2 lo2 =
+        __floats2half2_rn(run_acc[0] * scale, run_acc[1] * scale);
+    const __half2 hi2 =
+        __floats2half2_rn(run_acc[2] * scale, run_acc[3] * scale);
+    uint2 packed;
+    packed.x = *reinterpret_cast<const uint32_t*>(&lo2);
+    packed.y = *reinterpret_cast<const uint32_t*>(&hi2);
+    *reinterpret_cast<uint2*>(out + out_base + dim) = packed;
+    return;
+  }
+
+  // Publish this CTA's partial exactly as the partition kernel would.
+  const int64_t tmp_head_base =
+      static_cast<int64_t>(batch_idx) * tmp_out_stride0 +
+      static_cast<int64_t>(head_idx) * tmp_out_stride1;
+  const int64_t stats_head_base =
+      static_cast<int64_t>(batch_idx) * stats_stride0 +
+      static_cast<int64_t>(head_idx) * stats_stride1;
+  {
+    const float inv_run_sum = run_sum > 0.f ? 1.f / run_sum : 0.f;
+    const __half2 lo2 =
+        __floats2half2_rn(run_acc[0] * inv_run_sum, run_acc[1] * inv_run_sum);
+    const __half2 hi2 =
+        __floats2half2_rn(run_acc[2] * inv_run_sum, run_acc[3] * inv_run_sum);
+    uint2 packed;
+    packed.x = *reinterpret_cast<const uint32_t*>(&lo2);
+    packed.y = *reinterpret_cast<const uint32_t*>(&hi2);
+    *reinterpret_cast<uint2*>(tmp_out + tmp_head_base +
+                              static_cast<int64_t>(cta) * tmp_out_stride2 +
+                              dim) = packed;
+    if (lane == 0) {
+      max_logits[stats_head_base + cta] = run_max;
+      exp_sums[stats_head_base + cta] = run_sum;
+    }
+  }
+  // Release: every thread's partial is visible device-wide before thread 0
+  // counts this CTA in.
+  __threadfence();
+  __syncthreads();
+  unsigned int* counter =
+      counters + static_cast<int64_t>(batch_idx) * num_heads_kv + kv_head_idx;
+  if (threadIdx.x == 0) {
+    const unsigned int arrived = atomicAdd(counter, 1u);
+    is_last_shared = arrived == static_cast<unsigned int>(active - 1);
+  }
+  __syncthreads();
+  if (!is_last_shared) {
+    return;
+  }
+  __threadfence();
+
+  // Last CTA: warp w combines head w's W partials in index order. Loads use
+  // the L2-coherent path (ld.global.cg): the partials were written by other
+  // SMs during this kernel.
+  float* max_staged = pv_shared + warp * 2 * kGqaFusedMaxCtasPerHead;
+  float* weight_staged = max_staged + kGqaFusedMaxCtasPerHead;
+  float local_max = -1.0e20f;
+  for (int i = lane; i < active; i += kWarpSize) {
+    const float m = __ldcg(max_logits + stats_head_base + i);
+    max_staged[i] = m;
+    local_max = fmaxf(local_max, m);
+  }
+  const float global_max = fmaxf(warp_allreduce_max(local_max), sink);
+  float local_sum = 0.f;
+  for (int i = lane; i < active; i += kWarpSize) {
+    const float weight = __ldcg(exp_sums + stats_head_base + i) *
+                         __expf(max_staged[i] - global_max);
+    weight_staged[i] = weight;
+    local_sum += weight;
+  }
+  const float global_sum =
+      warp_allreduce_sum(local_sum) + __expf(sink - global_max);
+  const float inv_global_sum = global_sum > 0.f ? 1.f / global_sum : 0.f;
+  __syncwarp();
+
+  const __half* tmp_base = tmp_out + tmp_head_base + dim;
+  float out_acc[4] = {0.f, 0.f, 0.f, 0.f};
+  // Sixteen independent L2 loads in flight per lane: the tail is latency
+  // bound (64 partials at 4K on a 160-slot grid).
+#pragma unroll 16
+  for (int i = 0; i < active; ++i) {
+    const uint2 raw = __ldcg(reinterpret_cast<const uint2*>(
+        tmp_base + static_cast<int64_t>(i) * tmp_out_stride2));
+    const float2 v01 =
+        __half22float2(*reinterpret_cast<const __half2*>(&raw.x));
+    const float2 v23 =
+        __half22float2(*reinterpret_cast<const __half2*>(&raw.y));
+    const float w = weight_staged[i];
+    out_acc[0] = fmaf(w, v01.x, out_acc[0]);
+    out_acc[1] = fmaf(w, v01.y, out_acc[1]);
+    out_acc[2] = fmaf(w, v23.x, out_acc[2]);
+    out_acc[3] = fmaf(w, v23.y, out_acc[3]);
+  }
+  const __half2 lo2 = __floats2half2_rn(out_acc[0] * inv_global_sum,
+                                        out_acc[1] * inv_global_sum);
+  const __half2 hi2 = __floats2half2_rn(out_acc[2] * inv_global_sum,
+                                        out_acc[3] * inv_global_sum);
+  uint2 packed;
+  packed.x = *reinterpret_cast<const uint32_t*>(&lo2);
+  packed.y = *reinterpret_cast<const uint32_t*>(&hi2);
+  *reinterpret_cast<uint2*>(out + out_base + dim) = packed;
+  if (threadIdx.x == 0) {
+    // Ready for the next launch; kernel boundaries order this store.
+    *counter = 0u;
+  }
+}
+
+// CTAs per (sequence, KV head) for the fused kernel: enough to fill every SM
+// once at the kernel's occupancy, within the workspace's partial slots. A
+// function of the launch shape and the device only, never of sequence
+// lengths, so a captured graph replays correctly for any length.
+inline int gqa8_d128_fused_ctas_per_head(const int batch_size,
+                                         const int num_heads_kv,
+                                         const int partial_slots) {
+  static const int blocks_per_sm = [] {
+    int blocks = 0;
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &blocks,
+            flash_attention_decode_gqa8_d128_fused_kernel<kGqaFusedMaxChunk>,
+            kThreadsPerBlock, 0) != cudaSuccess) {
+      (void)cudaGetLastError();
+      blocks = 1;
+    }
+    return std::max(blocks, 1);
+  }();
+  const int slots =
+      at::cuda::getCurrentDeviceProperties()->multiProcessorCount *
+      blocks_per_sm;
+  const int rows = std::max(1, batch_size * num_heads_kv);
+  const int ctas = (slots + rows - 1) / rows;
+  return std::max(1, std::min({ctas, partial_slots, kGqaFusedMaxCtasPerHead}));
+}
+
 // The grouped kernel loads q, K, V and the partials as aligned half8 vectors.
 inline bool gqa8_d128_decode_aligned(const at::Tensor& t) {
   if (reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 != 0) {
@@ -4008,7 +4419,8 @@ void launch_flash_attention_decode_paged(
     cudaStream_t stream, const int route_seq_len_begin = 0,
     const int route_seq_len_end = 0, const int route_seq_len_final = 0,
     const bool launch_reduce = true, const int* anchor_lens = nullptr,
-    const int anchored_window = 0, const float* sinks = nullptr) {
+    const int anchored_window = 0, const float* sinks = nullptr,
+    unsigned int* fused_counters = nullptr) {
   // Sinks enter only in the cross-partition reducer below, so a caller that
   // reduces the partials itself cannot drop them silently.
   TORCH_CHECK(launch_reduce || sinks == nullptr,
@@ -4054,7 +4466,33 @@ void launch_flash_attention_decode_paged(
   bool grouped = false;
   if constexpr (KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP16) {
     if (gqa8_d128_decode_eligible<D, PARTITION_SIZE, SEQ_LEN_ROUTE, PARTIAL_T>(
-            q, k_cache, v_cache, tmp_out, use_anchored, sinks)) {
+            q, k_cache, v_cache, tmp_out, use_anchored, sinks) &&
+        fused_counters != nullptr && launch_reduce &&
+        gqa8_d128_decode_aligned(out)) {
+      // One launch per layer: partitions and the sink-aware reduction.
+      const int ctas_per_head = gqa8_d128_fused_ctas_per_head(
+          batch_size, num_heads_kv, static_cast<int>(tmp_out.size(2)));
+      const dim3 fused_grid(batch_size, num_heads_kv, ctas_per_head);
+      flash_attention_decode_gqa8_d128_fused_kernel<kGqaFusedMaxChunk>
+          <<<fused_grid, block, 0, stream>>>(
+              reinterpret_cast<const __half*>(q.data_ptr<at::Half>()),
+              reinterpret_cast<const __half*>(k_cache.data_ptr<at::Half>()),
+              reinterpret_cast<const __half*>(v_cache.data_ptr<at::Half>()),
+              reinterpret_cast<__half*>(out.data_ptr<at::Half>()),
+              reinterpret_cast<__half*>(tmp_out.data_ptr()),
+              max_logits.data_ptr<float>(), exp_sums.data_ptr<float>(),
+              fused_counters, block_table.data_ptr<int>(),
+              seq_lens.data_ptr<int>(), sinks, max_num_blocks, num_heads_kv,
+              block_size, q.stride(0), q.stride(1), out.stride(0),
+              out.stride(1), tmp_out.stride(0), tmp_out.stride(1),
+              tmp_out.stride(2), max_logits.stride(0), max_logits.stride(1),
+              k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
+              v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),
+              softmax_scale, window_size_left);
+      return;
+    } else if (gqa8_d128_decode_eligible<D, PARTITION_SIZE, SEQ_LEN_ROUTE,
+                                         PARTIAL_T>(
+                   q, k_cache, v_cache, tmp_out, use_anchored, sinks)) {
       grouped = true;
       const dim3 group_grid(batch_size, num_heads_kv, max_num_partitions);
       flash_attention_decode_gqa8_d128_partition_kernel<PARTITION_SIZE>
@@ -5437,7 +5875,7 @@ at::Tensor flash_attention_grouped_sparse_page4(
   return out;
 }
 
-at::Tensor flash_attention_decode_paged_sinks(
+static at::Tensor decode_paged_sinks_impl(
     const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
     std::optional<at::Tensor>& out_, const at::Tensor& block_table,
     const at::Tensor& seq_lens, at::Tensor& tmp_out, at::Tensor& max_logits,
@@ -5446,7 +5884,8 @@ at::Tensor flash_attention_decode_paged_sinks(
     const int launch_num_partitions, const std::string& kv_cache_dtype,
     const float k_scale, const float v_scale, const int window_size_left,
     const int window_size_right, const std::optional<at::Tensor>& anchor_lens,
-    const int64_t anchored_window, const std::optional<at::Tensor>& sinks) {
+    const int64_t anchored_window, const std::optional<at::Tensor>& sinks,
+    const std::optional<at::Tensor>& fused_counters) {
   TORCH_CHECK(q.is_cuda(), "q must be on CUDA");
   TORCH_CHECK(k_cache.is_cuda() && v_cache.is_cuda(),
               "k/v cache must be on CUDA");
@@ -5574,6 +6013,24 @@ at::Tensor flash_attention_decode_paged_sinks(
     sinks_ptr = sink_values.data_ptr<float>();
   }
 
+  // Optional arrival counters for the single-kernel grouped sink decode, one
+  // per (sequence, KV head), zero between launches. Without them, or for a
+  // shape the grouped kernel does not take, decode keeps two launches.
+  unsigned int* fused_counters_ptr = nullptr;
+  if (fused_counters.has_value() && sinks_ptr != nullptr) {
+    const at::Tensor& counters = fused_counters.value();
+    TORCH_CHECK(counters.is_cuda() && counters.device() == q.device(),
+                "fused decode counters must be on the q device");
+    TORCH_CHECK(counters.dtype() == torch::kInt32,
+                "fused decode counters must be int32");
+    TORCH_CHECK(counters.is_contiguous(),
+                "fused decode counters must be contiguous");
+    TORCH_CHECK(
+        counters.numel() >= static_cast<int64_t>(batch_size) * num_heads_kv,
+        "fused decode counters must cover [B, H_kv]");
+    fused_counters_ptr = reinterpret_cast<unsigned int*>(counters.data_ptr());
+  }
+
   at::Tensor out = out_.has_value() ? out_.value() : torch::empty_like(q);
   TORCH_CHECK(out.is_cuda(), "out must be on CUDA");
   TORCH_CHECK(out.dtype() == torch::kFloat16, "out must be fp16");
@@ -5588,7 +6045,8 @@ at::Tensor flash_attention_decode_paged_sinks(
       q, k_cache, v_cache, out, block_table, seq_lens, tmp_out, max_logits,   \
       exp_sums, active_num_partitions, softmax_scale, launch_num_partitions,  \
       k_scale, v_scale, window_size_left, window_size_right, stream, 0, 0, 0, \
-      true, anchor_lens_ptr, static_cast<int>(anchored_window), sinks_ptr)
+      true, anchor_lens_ptr, static_cast<int>(anchored_window), sinks_ptr,    \
+      fused_counters_ptr)
 
 #define LAUNCH_BY_KV_DTYPE(HDIM, PARTITION)                                   \
   do {                                                                        \
@@ -5665,6 +6123,41 @@ at::Tensor flash_attention_decode_paged_sinks(
 
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
+}
+
+at::Tensor flash_attention_decode_paged_sinks(
+    const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
+    std::optional<at::Tensor>& out_, const at::Tensor& block_table,
+    const at::Tensor& seq_lens, at::Tensor& tmp_out, at::Tensor& max_logits,
+    at::Tensor& exp_sums, const at::Tensor& active_num_partitions,
+    const float softmax_scale, const int partition_size,
+    const int launch_num_partitions, const std::string& kv_cache_dtype,
+    const float k_scale, const float v_scale, const int window_size_left,
+    const int window_size_right, const std::optional<at::Tensor>& anchor_lens,
+    const int64_t anchored_window, const std::optional<at::Tensor>& sinks) {
+  return decode_paged_sinks_impl(
+      q, k_cache, v_cache, out_, block_table, seq_lens, tmp_out, max_logits,
+      exp_sums, active_num_partitions, softmax_scale, partition_size,
+      launch_num_partitions, kv_cache_dtype, k_scale, v_scale, window_size_left,
+      window_size_right, anchor_lens, anchored_window, sinks, std::nullopt);
+}
+
+at::Tensor flash_attention_decode_paged_sinks_fused(
+    const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
+    std::optional<at::Tensor>& out_, const at::Tensor& block_table,
+    const at::Tensor& seq_lens, at::Tensor& tmp_out, at::Tensor& max_logits,
+    at::Tensor& exp_sums, const at::Tensor& active_num_partitions,
+    const float softmax_scale, const int partition_size,
+    const int launch_num_partitions, const std::string& kv_cache_dtype,
+    const float k_scale, const float v_scale, const int window_size_left,
+    const int window_size_right, const std::optional<at::Tensor>& anchor_lens,
+    const int64_t anchored_window, const std::optional<at::Tensor>& sinks,
+    const at::Tensor& fused_counters) {
+  return decode_paged_sinks_impl(
+      q, k_cache, v_cache, out_, block_table, seq_lens, tmp_out, max_logits,
+      exp_sums, active_num_partitions, softmax_scale, partition_size,
+      launch_num_partitions, kv_cache_dtype, k_scale, v_scale, window_size_left,
+      window_size_right, anchor_lens, anchored_window, sinks, fused_counters);
 }
 
 // The sink-free ABI keeps its original arity for existing direct callers.

@@ -683,6 +683,7 @@ if TYPE_CHECKING:
     VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL: bool = True
     VLLM_FLASH_V100_PREFILL_SCORE_BLOCK_TOKENS: int = 8192
     VLLM_FLASH_V100_SHARE_DECODE_WORKSPACE: bool = True
+    VLLM_SM70_FLINT_ATTN_FUSED_DECODE: bool = True
     VLLM_DFLASH_COMPACT_AUX_HIDDEN: bool = True
     VLLM_FLASH_V100_PREFILL_D256_GQA_V37: bool = False
     VLLM_FLASH_V100_PREFILL_SPLIT_KV: bool = False
@@ -10441,6 +10442,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
         lambda: os.getenv("VLLM_FLASH_V100_SHARE_DECODE_WORKSPACE", "1") != "0",
         description=(
             "Reuse decode scratch across row capacities on the same CUDA stream."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
+    ),
+    # Decode grouped GQA-8 D128 sink layers in one launch per layer.
+    "VLLM_SM70_FLINT_ATTN_FUSED_DECODE": env_var(
+        lambda: os.getenv("VLLM_SM70_FLINT_ATTN_FUSED_DECODE", "1") != "0",
+        description=(
+            "Decode grouped GQA-8 D128 sink layers in one launch per layer: "
+            "the partition grid fills the device once instead of covering the "
+            "captured context envelope, and the last CTA of each KV head "
+            "applies the sinks and writes the output. Set to 0 to restore the "
+            "partition kernel plus reducer."
         ),
         category="configuration",
         declared_default="True",

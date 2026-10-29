@@ -24,6 +24,9 @@ class PythonPolicy:
     padded_smem: bool
     dual_cta: bool
     partition_cause: str | None = None
+    # Grouped GQA-8 D128 sink decode in one launch per layer (partitions and
+    # reduction); False keeps the partition kernel plus the reducer.
+    sink_fused_decode: bool = True
 
     def partition(self) -> int | None:
         if self.partition_error is not None:
