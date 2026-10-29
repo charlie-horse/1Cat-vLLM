@@ -434,8 +434,10 @@ def test_skinny_route_admits_flint(monkeypatch, tp_size):
     ]
     assert selection["enabled"] is True and selection["reason"] is None
 
-    # Without the native operator the automatic route keeps TurboMind.
-    monkeypatch.delattr(torch.ops._C, "skinny_moe_qpn_sm70")
+    # Without the native operator the automatic route keeps TurboMind. Hide the
+    # whole namespace: torch.ops._C resolves a built extension's real operator
+    # again once the stub attribute is deleted.
+    monkeypatch.setattr(torch.ops, "_C", NS())
     assert not skinny_sm70_moe.skinny_backend_admitted(config)
 
 
