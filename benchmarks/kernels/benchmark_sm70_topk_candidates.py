@@ -13,7 +13,7 @@ lm_head: the rank's FP16 projection, for the bandwidth floor.
 """
 
 import argparse
-import statistics
+import time
 from types import SimpleNamespace
 
 import torch
@@ -24,19 +24,29 @@ from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p, random_sampl
 
 
 def _time(fn, iters):
+    """Return (GPU us, host us) per call.
+
+    GPU time is measured with the stream held behind a sleep kernel while
+    the host enqueues all iterations, so host overhead does not count.
+    """
     for _ in range(10):
         fn()
     torch.cuda.synchronize()
-    times = []
+    host_start = time.perf_counter()
     for _ in range(iters):
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
         fn()
-        end.record()
-        end.synchronize()
-        times.append(start.elapsed_time(end) * 1000.0)
-    return statistics.median(times)
+    host_us = (time.perf_counter() - host_start) * 1e6 / iters
+    torch.cuda.synchronize()
+    # Sleep about twice the host enqueue time (V100 at ~1.4 GHz).
+    torch.cuda._sleep(int(2 * host_us * iters * 1400))
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(iters):
+        fn()
+    end.record()
+    end.synchronize()
+    return start.elapsed_time(end) * 1000.0 / iters, host_us
 
 
 def main():
@@ -97,15 +107,17 @@ def _bench(rows, args, shard, weight):
     def lm_head():
         F.linear(hidden, weight)
 
-    ref_us = _time(reference, args.iters)
-    sel_us = _time(local_select, args.iters)
-    smp_us = _time(sample, args.iters)
-    gemm_us = _time(lm_head, args.iters)
-    gbps = weight.numel() * 2 / (gemm_us * 1e-6) / 1e9
+    ref_gpu, ref_host = _time(reference, args.iters)
+    sel_gpu, sel_host = _time(local_select, args.iters)
+    smp_gpu, smp_host = _time(sample, args.iters)
+    gemm_gpu, _ = _time(lm_head, args.iters)
+    gbps = weight.numel() * 2 / (gemm_gpu * 1e-6) / 1e9
     print(
-        f"rows={rows} reference={ref_us:.1f}us "
-        f"candidates={sel_us + smp_us:.1f}us (local top-32 {sel_us:.1f} + "
-        f"sample {smp_us:.1f}) lm_head={gemm_us:.1f}us ({gbps:.0f} GB/s)"
+        f"rows={rows} GPU us: reference={ref_gpu:.1f} "
+        f"candidates={sel_gpu + smp_gpu:.1f} (local top-32 {sel_gpu:.1f} + "
+        f"sample {smp_gpu:.1f}) lm_head={gemm_gpu:.1f} ({gbps:.0f} GB/s) | "
+        f"host us/call: reference={ref_host:.1f} local top-32={sel_host:.1f} "
+        f"sample={smp_host:.1f}"
     )
 
 

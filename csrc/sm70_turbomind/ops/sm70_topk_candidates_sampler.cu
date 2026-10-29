@@ -3,13 +3,14 @@
 //
 // Small-batch top-k/top-p sampling from vocab-parallel candidates (SM70).
 //
-// 1. sm70_local_top32_half_wire: each TP rank selects the 32 largest of its
-//    FP16 logits shard and writes them as one FP32 row
-//    [32 values (descending), 32 global token ids as exact floats].
+// 1. sm70_local_top32_half: each TP rank selects the 32 largest of its FP16
+//    logits shard (2048-logit tile sorts, then one merge per row) and returns
+//    them as one FP32 row [32 values (descending), 32 global token ids as
+//    exact floats].
 // 2. The caller all-gathers these rows across TP ranks (rank-major, dim 0).
-// 3. sm70_sample_topk_candidates_out: per request, the vLLM reference
-//    top-k/top-p sampler (apply_top_k_top_p_pytorch + random_sample)
-//    restricted to the gathered candidates:
+// 3. sm70_sample_topk_candidates: per request, the vLLM reference top-k/top-p
+//    sampler (apply_top_k_top_p_pytorch + random_sample) restricted to the
+//    gathered candidates:
 //      - temperature division in FP32 (round-to-nearest, as logits.div_),
 //      - top-k keeps every candidate equal to the k-th value (the reference
 //        masks only values strictly below it),
@@ -19,9 +20,14 @@
 //      - argmax(prob / q) where q is the exact exponential the reference's
 //        q.exponential_() would draw for that token from the same Philox
 //        generator state; the generator advances by the same offset.
-//    Top-k never needs more than k candidates, so with k <= 20 and 32 per
-//    rank the result matches the full-vocabulary reference except when more
-//    than 12 extra logits tie the k-th value on one rank.
+//
+// Known limit: a rank contributes at most 32 candidates. If a rank's 32nd
+// candidate still reaches the k-th value, more of its logits may tie the
+// k-th value; the reference would keep them, this sampler cannot. With
+// k <= 20 that takes more than 12 extra exact FP16 ties on one rank. The
+// kernel then increments the optional `overflow` counter so the host can
+// report it; the sampled token is still drawn from the reference
+// distribution restricted to the candidates.
 
 #include <torch/all.h>
 
@@ -49,15 +55,14 @@ constexpr int kWireWidth = 2 * kLocalK;
 constexpr int kSelectThreads = 256;
 constexpr int kTileItems = 8;
 constexpr int kTile = kSelectThreads * kTileItems;  // 2048 logits per block
-constexpr int kMaxTiles = 64;                       // shard <= 131072 logits
-constexpr int kMergeItems = kMaxTiles * kLocalK / kSelectThreads;  // 8
+constexpr int kMaxTiles = 128;                      // shard <= 262144 logits
 constexpr int kMaxCandidates = 128;                 // TP <= 4
 constexpr int kMaxRows = 8;
 constexpr int kNativeBlockSize = 256;
 constexpr int kNativeUnroll = 4;
 constexpr int kMaxGeneratorOffsetsPerCurandCall = 4;
 
-static_assert(kMergeItems * kSelectThreads >= kMaxTiles * kLocalK);
+static_assert(16 * kSelectThreads >= kMaxTiles * kLocalK);
 
 // Order-preserving 16-bit key of an FP16 value; 0 is reserved for "empty".
 // -0 sorts as +0 and NaN sorts below -inf.
@@ -112,7 +117,8 @@ __global__ void __launch_bounds__(kSelectThreads)
   // Only the value half needs ordering; the tile offset rides along.
   Sort(storage).SortDescending(keys, 16, 32);
 
-  uint32_t* out = partial + (static_cast<int64_t>(row) * tiles + tile) * kLocalK;
+  uint32_t* out =
+      partial + (static_cast<int64_t>(row) * tiles + tile) * kLocalK;
 #pragma unroll
   for (int i = 0; i < kTileItems; ++i) {
     const int rank = local_base + i;
@@ -123,23 +129,24 @@ __global__ void __launch_bounds__(kSelectThreads)
 }
 
 // Stage 2: per row, the 32 largest of the tiles' candidates -> wire row.
+template <int Items>
 __global__ void __launch_bounds__(kSelectThreads)
     local_top32_merge_kernel(const uint16_t* __restrict__ logits,
                              int64_t row_stride, int tiles,
                              int64_t vocab_start,
                              const uint32_t* __restrict__ partial,
                              float* __restrict__ wire) {
-  using Sort = cub::BlockRadixSort<uint32_t, kSelectThreads, kMergeItems>;
+  using Sort = cub::BlockRadixSort<uint32_t, kSelectThreads, Items>;
   __shared__ typename Sort::TempStorage storage;
 
   const int row = blockIdx.x;
   const int count = tiles * kLocalK;
   const uint32_t* row_partial = partial + static_cast<int64_t>(row) * count;
 
-  uint32_t keys[kMergeItems];
+  uint32_t keys[Items];
 #pragma unroll
-  for (int i = 0; i < kMergeItems; ++i) {
-    const int position = threadIdx.x * kMergeItems + i;
+  for (int i = 0; i < Items; ++i) {
+    const int position = threadIdx.x * Items + i;
     const uint32_t key = position < count ? row_partial[position] : 0u;
     keys[i] = key == 0u ? 0u
                         : (key & 0xffff0000u) |
@@ -149,8 +156,8 @@ __global__ void __launch_bounds__(kSelectThreads)
 
   float* out = wire + static_cast<int64_t>(row) * kWireWidth;
 #pragma unroll
-  for (int i = 0; i < kMergeItems; ++i) {
-    const int rank = threadIdx.x * kMergeItems + i;
+  for (int i = 0; i < Items; ++i) {
+    const int rank = threadIdx.x * Items + i;
     if (rank < kLocalK) {
       float value = -INFINITY;
       float token = -1.f;
@@ -197,7 +204,8 @@ __global__ void __launch_bounds__(kMaxCandidates)
         const float* __restrict__ temperature,
         const int32_t* __restrict__ top_k, const float* __restrict__ top_p,
         int rows, int tp_size, int64_t vocab_size, int64_t row_index_stride,
-        int64_t total_threads, at::PhiloxCudaState philox_args) {
+        int64_t total_threads, at::PhiloxCudaState philox_args,
+        int32_t* __restrict__ overflow) {
   __shared__ float s_value[kMaxCandidates];
   __shared__ int s_token[kMaxCandidates];
   __shared__ float s_sorted_value[kMaxCandidates];
@@ -208,6 +216,7 @@ __global__ void __launch_bounds__(kMaxCandidates)
   const int row = blockIdx.x;
   const int t = threadIdx.x;
   const int candidates = tp_size * kLocalK;
+  const float row_temperature = temperature[row];
 
   bool valid = false;
   float value = -INFINITY;
@@ -219,7 +228,7 @@ __global__ void __launch_bounds__(kMaxCandidates)
     const float id = src[kLocalK + t % kLocalK];
     if (id >= 0.f && id < static_cast<float>(vocab_size) && !isnan(raw)) {
       // logits.div_(temperature): IEEE division even under fast math.
-      value = __fdiv_rn(raw, temperature[row]);
+      value = __fdiv_rn(raw, row_temperature);
       token = static_cast<int>(id);
       valid = !isnan(value);
     }
@@ -264,6 +273,14 @@ __global__ void __launch_bounds__(kMaxCandidates)
         row * row_index_stride + s_sorted_token[t], total_threads,
         philox_args);
   }
+  // A rank whose last candidate still reaches the k-th value may hold more
+  // tied logits than it sent (see the known limit above).
+  if (overflow != nullptr && t < tp_size) {
+    const float last = s_value[t * kLocalK + kLocalK - 1];
+    if (s_token[t * kLocalK + kLocalK - 1] >= 0 && last >= kth_value) {
+      atomicAdd(overflow, 1);
+    }
+  }
   __syncthreads();
 
   if (t == 0) {
@@ -305,96 +322,100 @@ __global__ void __launch_bounds__(kMaxCandidates)
 
 }  // namespace
 
-void sm70_local_top32_half_wire(torch::Tensor logits, torch::Tensor partial,
-                                torch::Tensor wire, int64_t vocab_start,
-                                int64_t num_valid) {
-  TORCH_CHECK(logits.is_cuda() && partial.is_cuda() && wire.is_cuda(),
-              "sm70_local_top32_half_wire: tensors must be CUDA");
-  TORCH_CHECK(partial.device() == logits.device() &&
-                  wire.device() == logits.device(),
-              "sm70_local_top32_half_wire: device mismatch");
-  TORCH_CHECK(logits.scalar_type() == torch::kHalf &&
-                  partial.scalar_type() == torch::kInt32 &&
-                  wire.scalar_type() == torch::kFloat32,
-              "sm70_local_top32_half_wire: dtype mismatch");
+torch::Tensor sm70_local_top32_half(torch::Tensor logits, int64_t vocab_start,
+                                    int64_t num_valid) {
+  TORCH_CHECK(logits.is_cuda(), "sm70_local_top32_half: logits must be CUDA");
+  TORCH_CHECK(logits.scalar_type() == torch::kHalf,
+              "sm70_local_top32_half: logits must be float16");
   TORCH_CHECK(logits.dim() == 2 && logits.stride(1) == 1,
-              "sm70_local_top32_half_wire: logits must be row-major 2D");
+              "sm70_local_top32_half: logits must be row-major 2D");
   const int64_t rows = logits.size(0);
   const int64_t cols = logits.size(1);
   const int64_t tiles = (cols + kTile - 1) / kTile;
   TORCH_CHECK(rows >= 1 && rows <= kMaxRows,
-              "sm70_local_top32_half_wire: unsupported row count");
+              "sm70_local_top32_half: unsupported row count");
   TORCH_CHECK(tiles <= kMaxTiles && num_valid >= kLocalK && num_valid <= cols,
-              "sm70_local_top32_half_wire: unsupported shard width");
+              "sm70_local_top32_half: unsupported shard width");
   TORCH_CHECK(vocab_start >= 0 && vocab_start + cols <= (int64_t(1) << 24),
-              "sm70_local_top32_half_wire: token ids must fit FP32 exactly");
-  TORCH_CHECK(logits.stride(0) >= cols &&
-                  logits.stride(0) <= (int64_t(1) << 31) / rows,
-              "sm70_local_top32_half_wire: unsupported row stride");
-  TORCH_CHECK(partial.is_contiguous() && partial.numel() == rows * tiles *
-                                                               kLocalK,
-              "sm70_local_top32_half_wire: partial shape mismatch");
-  TORCH_CHECK(wire.is_contiguous() && wire.dim() == 2 && wire.size(0) == rows &&
-                  wire.size(1) == kWireWidth,
-              "sm70_local_top32_half_wire: wire shape mismatch");
+              "sm70_local_top32_half: token ids must fit FP32 exactly");
+  TORCH_CHECK(rows == 1 || (logits.stride(0) >= cols &&
+                            logits.stride(0) <= (int64_t(1) << 31) / rows),
+              "sm70_local_top32_half: unsupported row stride");
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(logits));
+  auto partial = torch::empty({rows, tiles * kLocalK},
+                              logits.options().dtype(torch::kInt32));
+  auto wire =
+      torch::empty({rows, kWireWidth}, logits.options().dtype(torch::kFloat32));
   const auto* data = reinterpret_cast<const uint16_t*>(logits.data_ptr());
+  const int64_t row_stride = rows == 1 ? cols : logits.stride(0);
   const bool vector_loads =
-      reinterpret_cast<uintptr_t>(data) % 16 == 0 && logits.stride(0) % 8 == 0;
+      reinterpret_cast<uintptr_t>(data) % 16 == 0 && row_stride % 8 == 0;
+  auto* partial_keys = reinterpret_cast<uint32_t*>(partial.data_ptr<int32_t>());
   auto stream = at::cuda::getCurrentCUDAStream();
   local_top32_tile_kernel<<<dim3(tiles, rows), kSelectThreads, 0, stream>>>(
-      data, logits.stride(0), static_cast<int>(cols),
-      static_cast<int>(num_valid), static_cast<int>(tiles), vector_loads,
-      reinterpret_cast<uint32_t*>(partial.data_ptr<int32_t>()));
+      data, row_stride, static_cast<int>(cols), static_cast<int>(num_valid),
+      static_cast<int>(tiles), vector_loads, partial_keys);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  local_top32_merge_kernel<<<rows, kSelectThreads, 0, stream>>>(
-      data, logits.stride(0), static_cast<int>(tiles), vocab_start,
-      reinterpret_cast<const uint32_t*>(partial.data_ptr<int32_t>()),
-      wire.data_ptr<float>());
+  if (tiles * kLocalK <= 8 * kSelectThreads) {
+    local_top32_merge_kernel<8><<<rows, kSelectThreads, 0, stream>>>(
+        data, row_stride, static_cast<int>(tiles), vocab_start, partial_keys,
+        wire.data_ptr<float>());
+  } else {
+    local_top32_merge_kernel<16><<<rows, kSelectThreads, 0, stream>>>(
+        data, row_stride, static_cast<int>(tiles), vocab_start, partial_keys,
+        wire.data_ptr<float>());
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return wire;
 }
 
-void sm70_sample_topk_candidates_out(
-    torch::Tensor sampled, torch::Tensor wire, torch::Tensor temperature,
-    torch::Tensor top_k, const std::optional<torch::Tensor>& top_p,
+torch::Tensor sm70_sample_topk_candidates(
+    torch::Tensor wire, torch::Tensor temperature, torch::Tensor top_k,
+    const std::optional<torch::Tensor>& top_p,
     const std::optional<at::Generator>& generator, int64_t vocab_size,
-    int64_t tp_size) {
-  TORCH_CHECK(sampled.is_cuda() && wire.is_cuda() && temperature.is_cuda() &&
-                  top_k.is_cuda(),
-              "sm70_sample_topk_candidates_out: tensors must be CUDA");
-  TORCH_CHECK(sampled.scalar_type() == torch::kInt32 &&
-                  wire.scalar_type() == torch::kFloat32 &&
+    int64_t tp_size, const std::optional<torch::Tensor>& overflow) {
+  TORCH_CHECK(wire.is_cuda() && temperature.is_cuda() && top_k.is_cuda(),
+              "sm70_sample_topk_candidates: tensors must be CUDA");
+  TORCH_CHECK(wire.scalar_type() == torch::kFloat32 &&
                   temperature.scalar_type() == torch::kFloat32 &&
                   top_k.scalar_type() == torch::kInt32,
-              "sm70_sample_topk_candidates_out: dtype mismatch");
+              "sm70_sample_topk_candidates: dtype mismatch");
   TORCH_CHECK(tp_size >= 1 && tp_size * kLocalK <= kMaxCandidates,
-              "sm70_sample_topk_candidates_out: unsupported TP size");
+              "sm70_sample_topk_candidates: unsupported TP size");
   TORCH_CHECK(wire.dim() == 2 && wire.size(1) == kWireWidth &&
                   wire.size(0) % tp_size == 0 && wire.is_contiguous(),
-              "sm70_sample_topk_candidates_out: wire shape mismatch");
+              "sm70_sample_topk_candidates: wire shape mismatch");
   const int64_t rows = wire.size(0) / tp_size;
   TORCH_CHECK(rows >= 1 && rows <= kMaxRows,
-              "sm70_sample_topk_candidates_out: unsupported row count");
-  TORCH_CHECK(sampled.numel() == rows && sampled.is_contiguous() &&
-                  temperature.numel() == rows && temperature.is_contiguous() &&
+              "sm70_sample_topk_candidates: unsupported row count");
+  TORCH_CHECK(temperature.numel() == rows && temperature.is_contiguous() &&
                   top_k.numel() == rows && top_k.is_contiguous(),
-              "sm70_sample_topk_candidates_out: per-row tensor mismatch");
+              "sm70_sample_topk_candidates: per-row tensor mismatch");
   const float* top_p_ptr = nullptr;
   if (top_p.has_value()) {
     TORCH_CHECK(top_p->is_cuda() && top_p->scalar_type() == torch::kFloat32 &&
                     top_p->numel() == rows && top_p->is_contiguous(),
-                "sm70_sample_topk_candidates_out: top_p mismatch");
+                "sm70_sample_topk_candidates: top_p mismatch");
     top_p_ptr = top_p->data_ptr<float>();
   }
+  int32_t* overflow_ptr = nullptr;
+  if (overflow.has_value()) {
+    TORCH_CHECK(overflow->is_cuda() &&
+                    overflow->scalar_type() == torch::kInt32 &&
+                    overflow->numel() == 1,
+                "sm70_sample_topk_candidates: overflow must be int32[1]");
+    overflow_ptr = overflow->data_ptr<int32_t>();
+  }
   TORCH_CHECK(vocab_size >= kLocalK && vocab_size <= (int64_t(1) << 24),
-              "sm70_sample_topk_candidates_out: invalid vocabulary size");
+              "sm70_sample_topk_candidates: invalid vocabulary size");
   // A request generator draws its own row (q[i].exponential_(generator));
   // otherwise one default-generator draw covers the [rows, vocab] tensor.
   TORCH_CHECK(!generator.has_value() || rows == 1,
-              "sm70_sample_topk_candidates_out: generator needs one row");
+              "sm70_sample_topk_candidates: generator needs one row");
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(wire));
+  auto sampled = torch::empty({rows}, wire.options().dtype(torch::kInt32));
   const int64_t numel = generator.has_value() ? vocab_size : rows * vocab_size;
   const auto* properties = at::cuda::getCurrentDeviceProperties();
   const int64_t blocks_per_sm =
@@ -420,6 +441,8 @@ void sm70_sample_topk_candidates_out(
       sampled.data_ptr<int32_t>(), wire.data_ptr<float>(),
       temperature.data_ptr<float>(), top_k.data_ptr<int32_t>(), top_p_ptr,
       static_cast<int>(rows), static_cast<int>(tp_size), vocab_size,
-      generator.has_value() ? 0 : vocab_size, total_threads, philox_args);
+      generator.has_value() ? 0 : vocab_size, total_threads, philox_args,
+      overflow_ptr);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return sampled;
 }

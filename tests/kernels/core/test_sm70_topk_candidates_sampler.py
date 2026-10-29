@@ -91,7 +91,7 @@ def _offset():
 
 
 @pytest.mark.parametrize("rows", [1, 2])
-@pytest.mark.parametrize("cols", [75072, 37536, 1000, 131072])
+@pytest.mark.parametrize("cols", [75072, 37536, 1000, 131072, 150144])
 @pytest.mark.parametrize("vocab_start", [0, 75072])
 @torch.inference_mode()
 def test_local_top32_matches_topk(rows, cols, vocab_start):
@@ -205,3 +205,26 @@ def test_distribution_chi_square():
     dof = int(big.sum().item()) - 1
     assert dof >= 5
     assert chi2 < dof + 6 * math.sqrt(2 * dof) + 10, (chi2, dof)
+
+
+@pytest.mark.parametrize("ties_on_rank", [0, 40])
+@torch.inference_mode()
+def test_tie_overflow_is_counted(ties_on_rank):
+    """Rows whose k-th value ties past a rank's 32 candidates are counted."""
+    _require_sm70()
+    device = torch.device("cuda", torch.cuda.current_device())
+    logits = _logits(1, "flat", seed=5).float()
+    if ties_on_rank:
+        logits[0, 100 : 100 + ties_on_rank] = 20.0
+    logits = logits.half()
+    metadata = _metadata(1, 1.0, 20, 0.95)
+    before = candidates.overflow_count(device)
+    sampled = candidates.sample_topk_candidates(
+        _gathered_wire(logits, 2), metadata, tp_size=2, vocab_size=VOCAB
+    )
+    assert sampled is not None
+    after = candidates.overflow_count(device)
+    assert after - before == (1 if ties_on_rank else 0)
+    if ties_on_rank:
+        # The reference keeps all 40 ties; the sampled token is one of them.
+        assert 100 <= int(sampled.item()) < 100 + ties_on_rank
