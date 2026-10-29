@@ -21,6 +21,7 @@ import regex as re
 import torch
 from torch import nn
 
+from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (
@@ -492,6 +493,12 @@ class FlintForCausalLM(nn.Module, SupportsPP):
         else:
             self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(config.vocab_size)
+        if get_pp_group().is_last_rank and envs.VLLM_SM70_FLINT_SAMPLER:
+            # Vocab-parallel sampling: the runner asks for these per step and
+            # admits them only for the batches they reproduce exactly (pure
+            # greedy; top-k <= 20 random sampling without logprobs).
+            self.get_top_tokens = self._get_top_tokens
+            self.get_topk_candidates = self._get_topk_candidates
         self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
             self.model.make_empty_intermediate_tensors
         )
@@ -510,6 +517,17 @@ class FlintForCausalLM(nn.Module, SupportsPP):
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
+
+    def _get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # Greedy argmax over the regular LM-head logits; the fused SM70
+        # top-1 projection forms FP16 products, too coarse for this head's
+        # folded output scale.
+        return self.logits_processor.get_top_tokens(
+            self.lm_head, hidden_states, fused_top1=False
+        )
+
+    def _get_topk_candidates(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        return self.logits_processor.get_topk_candidates(self.lm_head, hidden_states)
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return _expert_params_mapping(self.config.num_experts)

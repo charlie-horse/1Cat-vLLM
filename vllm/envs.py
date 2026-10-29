@@ -441,6 +441,7 @@ if TYPE_CHECKING:
     VLLM_SM70_COMPACT_TOPK20_SAMPLER: bool = False
     VLLM_SM70_CHUNKED_TOPK20_CHUNKS: int = 0
     VLLM_SM70_TP_LOCAL_TOPK20_SAMPLER: bool = False
+    VLLM_SM70_FLINT_SAMPLER: bool = True
     VLLM_SM70_TOPK_TOPP_8_WARPS: bool = False
     VLLM_SM70_TOPK_TOPP_B8_B16_8_WARPS: bool = True
     VLLM_SM70_ASYNC_SCHEDULING_QUEUE_DEPTH: int = 0
@@ -8677,6 +8678,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="configuration",
         declared_default="False",
         effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
+    ),
+    # Flint on SM70: sample from vocab-parallel candidates instead of the
+    # full-vocabulary logits (greedy argmax pairs; rank-local top-32 logits
+    # for top-k <= 20 random sampling without logprobs or penalties).
+    "VLLM_SM70_FLINT_SAMPLER": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_FLINT_SAMPLER", "1"))),
+        description=(
+            "SM70 Flint: sample from vocab-parallel candidates. Greedy batches "
+            "exchange per-rank argmax pairs; random batches with top-k <= 20 "
+            "and no logprobs, penalties or logits processors exchange each "
+            "rank's top-32 logits and sample them with the reference top-k/"
+            "top-p semantics and the same Philox draws. Set 0 to gather the "
+            "full logits and use the regular sampler."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
         user_visible=False,
