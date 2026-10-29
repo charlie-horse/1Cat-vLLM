@@ -1,5 +1,3 @@
 nav:
   - README.md
   - gpu.md
-  - cpu.md
-  - TPU: https://docs.vllm.ai/projects/tpu/en/latest/getting_started/installation/
