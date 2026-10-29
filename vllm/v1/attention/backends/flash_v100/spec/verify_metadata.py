@@ -28,7 +28,13 @@ logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
 def configured_smallq_max_query_len(
     self: Any,
 ) -> int:
-    return int(cast(int, flash_v100_policy().smallq_max_q))
+    # Borrow the engine-resolved policy: builders run outside a forward
+    # context, where flash_v100_policy() would resolve a fresh standalone
+    # policy from the environment on every decode step (~0.8 ms each).
+    policy = flash_v100_policy(getattr(self, "vllm_config", None))
+    if policy is None:
+        policy = flash_v100_policy()
+    return int(cast(int, policy.smallq_max_q))
 
 
 def configured_smallq_max_model_len(
