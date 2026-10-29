@@ -1030,12 +1030,16 @@ int Gemm::Run(const Operation& operation, float alpha, const void* A,
       }
     }
     const auto& actual = context.get_desc(*spec.kernel);
-    if (spec.splits >
+    // A spec dispatched for another group count (compact grouped rows are
+    // dispatched as num=1) may ask for more split-K than the workspace holds
+    // for the actual groups. Run it with the splits that fit, as
+    // KernelImpl::Launch would, instead of failing: the measurer ignores the
+    // return code, so a rejected spec used to time as the fastest candidate.
+    spec.splits = std::min(
+        spec.splits,
         spec.kernel->GetMaxSplits({actual.m, actual.n, actual.k, actual.num},
                                   spec.swizzle, workspace.barriers_size,
-                                  workspace.partials_size)) {
-      return -1;
-    }
+                                  workspace.partials_size));
     auto _workspace = workspace;
     return spec.kernel->Launch(operation, alpha, A, Adesc, U, Udesc, B, Bdesc,
                                V, Vdesc, beta, C, Cdesc, D, Ddesc, spec.swizzle,
