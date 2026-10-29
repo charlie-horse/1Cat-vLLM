@@ -43,7 +43,6 @@ nav:
       - contributing/model/tests.md
       - contributing/model/multimodal.md
       - contributing/model/transcription.md
-    - CI: contributing/ci
     - Design Documents:
       - Plugins:
         - design/*plugin*.md
@@ -59,7 +58,6 @@ nav:
   - CLI Reference: cli
   - Community:
     - community/*
-    - Governance: governance
     - Blog: https://blog.vllm.ai
     - Forum: https://discuss.vllm.ai
     - Slack: https://slack.vllm.ai
