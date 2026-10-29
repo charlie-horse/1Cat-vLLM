@@ -624,6 +624,23 @@ class CommunicationPolicy(ExecutionPolicy):
             )
             self.sources["tp8_hierarchical"] = "typed:native"
 
+    def early_value(self, field):
+        """Resolve one aliased field before the engine-wide resolution.
+
+        For config hooks that run before ``resolve``; the later resolution
+        keeps the recorded source and value.
+        """
+        from vllm.config.utils import resolve_legacy_fields
+
+        if field not in self.sources:
+            resolve_legacy_fields(
+                self,
+                {field: self.aliases[field]},
+                reader=type(self).legacy_reader,
+                deferred_errors=self.provider_errors,
+            )
+        return self.value(field)
+
     def compute_hash(self):
         return hash_factors(
             {"policy": super().compute_hash(), "native": self.native.compute_hash()}

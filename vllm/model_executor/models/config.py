@@ -311,7 +311,7 @@ def _sm70_tp2_allreduce_add_rms_rejection(vllm_config: "VllmConfig") -> str | No
     Called only for SM70 deployments. The route needs TP2 without pipeline
     stages, FP16, hidden size 2048 and the custom all-reduce. Its kill switch
     (VLLM_SM70_FLINT_AR_RMSNORM, parallel_config.communication.ar_add_rms_tp2)
-    is resolved after this hook and checked by the compile pass.
+    is resolved here, so =0 leaves the pass configuration untouched.
     """
     import torch
 
@@ -333,6 +333,8 @@ def _sm70_tp2_allreduce_add_rms_rejection(vllm_config: "VllmConfig") -> str | No
         return f"hidden_size={model_config.get_hidden_size()}"
     if vllm_config.compilation_config.pass_config.fuse_allreduce_rms is False:
         return "fuse_allreduce_rms is disabled"
+    if not parallel_config.communication.early_value("ar_add_rms_tp2"):
+        return "VLLM_SM70_FLINT_AR_RMSNORM=0"
     return None
 
 

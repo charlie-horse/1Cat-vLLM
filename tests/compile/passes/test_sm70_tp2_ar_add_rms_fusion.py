@@ -171,7 +171,8 @@ def _config(**overrides):
             pipeline_parallel_size=values["pp"],
             disable_custom_all_reduce=values["disable_ca"],
             communication=SimpleNamespace(
-                value=lambda field: {"ar_add_rms_tp2": values["switch"]}[field]
+                value=lambda field: {"ar_add_rms_tp2": values["switch"]}[field],
+                early_value=lambda field: {"ar_add_rms_tp2": values["switch"]}[field],
             ),
         ),
         model_config=SimpleNamespace(
@@ -203,6 +204,7 @@ def test_hook_requests_the_pass():
         ({"dtype": torch.bfloat16}, "dtype"),
         ({"hidden": 4096}, "hidden_size=4096"),
         ({"fuse": False}, "fuse_allreduce_rms"),
+        ({"switch": False}, "VLLM_SM70_FLINT_AR_RMSNORM=0"),
     ],
 )
 def test_hook_rejections(overrides, reason):
@@ -210,6 +212,28 @@ def test_hook_rejections(overrides, reason):
     assert reason in model_config_hooks._sm70_tp2_allreduce_add_rms_rejection(cfg)
     model_config_hooks.FlintModelConfig._configure_sm70_allreduce_add_rms(cfg)
     assert cfg.compilation_config.pass_config.fuse_allreduce_add_rms_tp2 is False
+
+
+@pytest.mark.parametrize("raw, requested", [(None, True), ("1", True), ("0", False)])
+def test_hook_reads_the_kill_switch(monkeypatch, raw, requested):
+    """=0 leaves the pass configuration (and its compile hash) untouched."""
+    from vllm.config.execution_policy import CommunicationPolicy
+
+    if raw is None:
+        monkeypatch.delenv("VLLM_SM70_FLINT_AR_RMSNORM", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_SM70_FLINT_AR_RMSNORM", raw)
+    cfg = _config()
+    communication = CommunicationPolicy()
+    cfg.parallel_config.communication = communication
+    model_config_hooks.FlintModelConfig._configure_sm70_allreduce_add_rms(cfg)
+    pass_config = cfg.compilation_config.pass_config
+    assert pass_config.fuse_allreduce_add_rms_tp2 is requested
+    assert pass_config.fuse_allreduce_rms is (True if requested else None)
+    # The engine-wide resolution later keeps the value read by the hook.
+    monkeypatch.setenv("VLLM_SM70_FLINT_AR_RMSNORM", "0" if requested else "1")
+    communication.resolve()
+    assert communication.value("ar_add_rms_tp2") is requested
 
 
 @pytest.mark.parametrize(
