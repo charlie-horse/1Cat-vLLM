@@ -66,14 +66,11 @@ def _assert_equal(actual, expected, context):
         assert torch.equal(a, e), context
 
 
-def _check(rank: int, rendezvous: str, expandable: bool) -> None:
+def _check(rank: int, rendezvous: str) -> None:
     from vllm.distributed.device_communicators.custom_all_reduce import (
         CustomAllreduce,
     )
 
-    if expandable:
-        # Before the first allocation, as PYTORCH_ALLOC_CONF would.
-        torch.cuda.memory._set_allocator_settings("expandable_segments:True")
     torch.accelerator.set_device_index(rank)
     torch.set_num_threads(1)
     dist.init_process_group(
@@ -178,7 +175,7 @@ def _check(rank: int, rendezvous: str, expandable: bool) -> None:
 
 
 @pytest.mark.parametrize("expandable", [False, True])
-def test_sm70_tp2_all_reduce_fused_add_rms_norm(tmp_path, expandable):
+def test_sm70_tp2_all_reduce_fused_add_rms_norm(monkeypatch, tmp_path, expandable):
     if torch.accelerator.device_count() < 2 or torch.cuda.get_device_capability() != (
         7,
         0,
@@ -190,9 +187,17 @@ def test_sm70_tp2_all_reduce_fused_add_rms_norm(tmp_path, expandable):
         ops._custom_ar_owner_namespace(), "tp2_all_reduce_fused_add_rms_norm"
     ):
         pytest.skip("the custom all-reduce extension lacks the fused collective")
+    # Through the environment, as the serve script sets it: the communicator
+    # reads this variable to keep expandable segments off while it captures
+    # graphs whose collective buffers it exports over CUDA IPC.
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    if expandable:
+        monkeypatch.setenv("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+    else:
+        monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
     mp.spawn(
         _check,
-        args=((tmp_path / "rendezvous").as_uri(), expandable),
+        args=((tmp_path / "rendezvous").as_uri(),),
         nprocs=2,
         join=True,
     )
