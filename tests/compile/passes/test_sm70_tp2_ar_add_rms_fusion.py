@@ -214,7 +214,7 @@ def test_hook_rejections(overrides, reason):
     assert cfg.compilation_config.pass_config.fuse_allreduce_add_rms_tp2 is False
 
 
-@pytest.mark.parametrize("raw, requested", [(None, False), ("1", True), ("0", False)])
+@pytest.mark.parametrize("raw, requested", [(None, True), ("1", True), ("0", False)])
 def test_hook_reads_the_kill_switch(monkeypatch, raw, requested):
     """=0 leaves the pass configuration (and its compile hash) untouched."""
     from vllm.config.execution_policy import CommunicationPolicy
@@ -258,7 +258,7 @@ def test_pass_admission(monkeypatch, overrides, tp, capabilities, has_op, reason
         assert reason in result
 
 
-@pytest.mark.parametrize("raw, expected", [(None, False), ("1", True), ("0", False)])
+@pytest.mark.parametrize("raw, expected", [(None, True), ("1", True), ("0", False)])
 def test_kill_switch_resolves_into_the_communication_policy(monkeypatch, raw, expected):
     from vllm.config.execution_policy import CommunicationPolicy
 

@@ -818,7 +818,7 @@ on by default unless noted.
    allow 24 warps per SM in W13 instead of 32, and W2 blocks start only
    after every W13 block is dispatched.
 6. **All-reduce fused with residual add and RMSNorm**
-   (`VLLM_SM70_FLINT_AR_RMSNORM`, off in this release), through the
+   (`VLLM_SM70_FLINT_AR_RMSNORM`), through the
    all-reduce + RMSNorm compile pass. Bitwise equal. The microbenchmark
    saves 1.71 us per boundary at 1 row (3.47 on MoE boundaries, where it
    also absorbs the shared + routed expert add), 0.90 / 2.76 at 2 rows. The
@@ -826,7 +826,7 @@ on by default unless noted.
    expert-output operands for peer IPC, which expandable segments cannot
    export (`cudaIpcGetMemHandle: invalid argument`). It now stages its
    inputs into the communicator's peer-readable buffer and registers nothing
-   at capture. End-to-end validation of this path is pending.
+   at capture. End to end it takes the 4K step from 6.00 to 5.59 ms.
 
 Per-layer attention, two launches -> fused, us:
 
@@ -843,17 +843,18 @@ sampled. A device counter records that and the server logs a warning; no
 serving run has hit it.
 
 End to end (single stream, random-token prompts, 256 tokens, median of 3).
-Before is `5fc02fa`; after is `claude/flint-gpu-opt` with `main` merged, including the
-host-metadata fix `2f9170d`, with switches 5 and 6 off:
+Before is `5fc02fa`; after is `claude/flint-gpu-opt` with `main` merged,
+including the host-metadata fix `2f9170d`. "Without AR" has switch 6 off;
+switch 5 is off in both:
 
-| Context, sampling | Before | After | ITL before / after |
-| --- | ---: | ---: | ---: |
-| 4K, default | 118.6 tok/s | **166.4-167.7 tok/s** | 8.45 / 6.00 ms |
-| 4K, greedy | 124.1 tok/s | **167.3 tok/s** | 8.09 / 6.00 ms |
-| 32K, default | 112.9 tok/s | **155.5 tok/s** | 9.06 / 6.64 ms |
-| 32K, greedy | 118.2 tok/s | **155.1 tok/s** | 8.69 / 6.65 ms |
+| Context, sampling | Before | After, without AR | After | ITL before / after |
+| --- | ---: | ---: | ---: | ---: |
+| 4K, default | 118.6 tok/s | 166.4 tok/s | **179.3 tok/s** | 8.45 / 5.59 ms |
+| 4K, greedy | 124.1 tok/s | 167.3 tok/s | **179.5 tok/s** | 8.09 / 5.60 ms |
+| 32K, default | 112.9 tok/s | 155.5 tok/s | **165.7 tok/s** | 9.06 / 6.23 ms |
+| 32K, greedy | 118.2 tok/s | 155.1 tok/s | **165.8 tok/s** | 8.69 / 6.23 ms |
 
-That is +40% (default) and +35% (greedy) at 4K, +38% and +31% at 32K.
+That is +51% (default) and +45% (greedy) at 4K, +47% and +40% at 32K.
 Default and greedy now decode at the same rate. TTFT does not change
 (0.68 s at 4K, 10.3 s at 32K). Runs still vary with the host CPU clock: one
 greedy 4K session gave 167.3 / 155 / 146 tok/s, a rerun 162.4 / 167.5 /
@@ -861,8 +862,11 @@ greedy 4K session gave 167.3 / 155 / 146 tok/s, a rerun 162.4 / 167.5 /
 
 Quality:
 
-- Probes: math 10/10, code 5/5, needle at 32K 3/3 (depths 0.1, 0.5, 0.9).
-  The "two greedy runs differ" warning shows up as on the baseline.
+- Probes, with and without AR: math 10/10, code 5/5, needle at 32K 3/3
+  (depths 0.1, 0.5, 0.9). The "two greedy runs differ" warning shows up as
+  on the baseline.
+- AR on against AR off: flips only at near-ties (margins 0.02-0.34); the
+  4K prompt is bit-identical.
 - Greedy (9 prompts x 128 tokens) against the old paths in the same tree:
   6 of 9 identical; the flips are near-ties (top-2 margins 0.0098, 0.066,
   0.198).
@@ -877,32 +881,31 @@ Quality:
 Done since the first version of this list: the TurboMind M=1 GEMVs (see
 [Single-token NVFP4 GEMV](#single-token-nvfp4-gemv)), the host-side
 attention metadata (`2f9170d`), the fused router and the vocab-parallel
-sampler (see [GPU decode fusions](#gpu-decode-fusions)). The persistent
-routed-expert kernel was built and is no faster.
+sampler, and the all-reduce + RMSNorm fusion (see
+[GPU decode fusions](#gpu-decode-fusions)). The persistent routed-expert
+kernel was built and is no faster.
 
-1. **All-reduce + RMSNorm.** About 0.25 ms per step. The path is built
-   (switch 6 above); it needs end-to-end validation, then default on.
-2. **Prefill.** The largest cost of a long request: TTFT is 10.4 s at 32K,
+1. **Prefill.** The largest cost of a long request: TTFT is 10.4 s at 32K,
    113 s at 128K and 398 s at 250K, against 3-11 s of decode for 256
    tokens. At 250K it also heats GPU 1 into thermal slowdown for the decode
    that follows. Sink layers bypass the tuned Flash-V100 prefill routes
    (split-KV, dense, small-query). The D128 paged prefill with sinks could
    get a grouped-query, split-KV path, as decode now has.
-3. **Long-context attention.** About 10% at 128K and 15% at 250K. The v3
+2. **Long-context attention.** About 10% at 128K and 15% at 250K. The v3
    kernel reaches about 510 GB/s at 128K; the 14 full layers took 3.7 ms
    per token there and 6.7 ms at 250K, and the one-launch kernel trims only
    7-8% of that. More loads in flight or a two-stage K/V prefetch could
    bring it closer to 800 GB/s.
-4. **Host time.** The step ITL is now 6.0 ms at 4K. Whether host work is
+3. **Host time.** The step ITL is now 5.6 ms at 4K. Whether host work is
    again close to the GPU time has not been measured since the fusions;
    profile both before the next GPU change.
-5. **Reproducible TurboMind tactic selection.** Now the main source of
+4. **Reproducible TurboMind tactic selection.** Now the main source of
    greedy drift across server starts: a shared LUT across ranks and warm-up
    for prefill lengths 3-15.
-6. **Single-launch routed-expert decode.** Fit three blocks per SM
+5. **Single-launch routed-expert decode.** Fit three blocks per SM
    (<= 56 registers) so W13 keeps 32 warps, or drop the kernel.
-7. **Dense GEMVs.** Close to the floor measured above; little is left.
-8. **Speculative decoding.** n-gram or suffix drafts for agent workloads.
+6. **Dense GEMVs.** Close to the floor measured above; little is left.
+7. **Speculative decoding.** n-gram or suffix drafts for agent workloads.
    The sink path rejects speculative configs today. The D128 verify path
    goes through the same scalar sink-aware decode kernel and would need the
    grouped kernel and a GPU check of verify correctness with sinks first.
