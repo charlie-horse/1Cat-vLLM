@@ -21,9 +21,9 @@ import regex as re
 import torch
 from torch import nn
 
-from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config_or_none
+from vllm.config.execution_policy import layer_policy
 from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
@@ -559,7 +559,8 @@ class FlintForCausalLM(nn.Module, SupportsPP):
         else:
             self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(config.vocab_size)
-        if get_pp_group().is_last_rank and envs.VLLM_SM70_FLINT_SAMPLER:
+        sampler_on = layer_policy(vllm_config).value("flint_sampler")
+        if get_pp_group().is_last_rank and sampler_on:
             # Vocab-parallel sampling: the runner asks for these per step and
             # admits them only for the batches they reproduce exactly (pure
             # greedy; top-k <= 20 random sampling without logprobs).

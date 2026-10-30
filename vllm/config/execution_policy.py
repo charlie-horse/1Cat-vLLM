@@ -462,6 +462,9 @@ class LayerExecutionPolicy(ExecutionPolicy):
     compact_topk20: bool | None = None
     """Admit the exact ordinary top-k20 sampler at its retained metadata gate."""
 
+    flint_sampler: bool | None = None
+    """Admit Flint's vocab-parallel top-k candidate sampler at load."""
+
     chunked_topk20_chunks: int | None = None
     """Chunk count consumed only by the admitted SM70 248320-vocabulary sampler."""
 
@@ -549,6 +552,7 @@ class LayerExecutionPolicy(ExecutionPolicy):
         "mtp_keep_quant": "VLLM_QWEN35_MTP_KEEP_QUANT",
         "online_qpn8": "VLLM_SM70_QWEN4_EXP_ONLINE_QPN8",
         "compact_topk20": "VLLM_SM70_COMPACT_TOPK20_SAMPLER",
+        "flint_sampler": "VLLM_SM70_FLINT_SAMPLER",
         "chunked_topk20_chunks": "VLLM_SM70_CHUNKED_TOPK20_CHUNKS",
         "glm_exact_kda_gemv": "VLLM_SM70_GLM53_EXACT_KDA_GEMV",
         "batch_fastpath": "VLLM_SM70_QWEN38_BATCH_FASTPATH",
