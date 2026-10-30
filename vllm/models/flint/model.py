@@ -60,6 +60,8 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import _encode_layer_name
+from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.ops import sm70_topk_candidates as topk_candidates
 
 from .configs import FlintConfig
 from .qk_norm_rope_kv import fused_route_rejection
@@ -565,7 +567,8 @@ class FlintForCausalLM(nn.Module, SupportsPP):
             # admits them only for the batches they reproduce exactly (pure
             # greedy; top-k <= 20 random sampling without logprobs).
             self.get_top_tokens = self._get_top_tokens
-            self.get_topk_candidates = self._get_topk_candidates
+            self.topk_candidates_reject_reason = topk_candidates.admission_reject_reason
+            self.sample_topk_candidates = self._sample_topk_candidates
         self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
             self.model.make_empty_intermediate_tensors
         )
@@ -593,8 +596,16 @@ class FlintForCausalLM(nn.Module, SupportsPP):
             self.lm_head, hidden_states, fused_top1=False
         )
 
-    def _get_topk_candidates(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
-        return self.logits_processor.get_topk_candidates(self.lm_head, hidden_states)
+    def _sample_topk_candidates(
+        self, hidden_states: torch.Tensor, sampling_metadata: SamplingMetadata
+    ) -> torch.Tensor | None:
+        return topk_candidates.sample_lm_head_candidates(
+            self.logits_processor,
+            self.lm_head,
+            hidden_states,
+            sampling_metadata,
+            vocab_size=self.config.vocab_size,
+        )
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return _expert_params_mapping(self.config.num_experts)

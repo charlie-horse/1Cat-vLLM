@@ -25,12 +25,23 @@ calls and logs a warning when it grows.
 """
 
 from functools import cache
+from typing import TYPE_CHECKING
 
 import torch
 
+from vllm.distributed import (
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
+)
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.v1.sample.metadata import SamplingMetadata
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.logits_processor import LogitsProcessor
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        VocabParallelEmbedding,
+    )
 
 logger = init_logger(__name__)
 
@@ -147,6 +158,100 @@ def metadata_reject_reason(
         # Mixed seeded/unseeded rows draw from several generators.
         return "generators"
     return None
+
+
+def argmax_invariant_reject_reason(
+    sampling_metadata: SamplingMetadata,
+) -> str | None:
+    """Only an inactive min-p processor may be among the argmax-invariant ones."""
+    from vllm.v1.sample.logits_processor.builtin import MinPLogitsProcessor
+
+    for processor in sampling_metadata.logitsprocs.argmax_invariant:
+        if isinstance(processor, MinPLogitsProcessor) and not processor.min_p_count:
+            continue
+        return "argmax_invariant_logits_processor"
+    return None
+
+
+def admission_reject_reason(
+    sampling_metadata: SamplingMetadata, num_reqs: int, device: torch.device
+) -> str | None:
+    """Device, batch and kernel admission of the sampler; None means admitted.
+
+    The runner checks its own state (spec decode, pooling, structured output,
+    thinking budget, non-argmax-invariant logits processors) before this.
+    """
+    if device.type != "cuda":
+        return "non_cuda"
+    if torch.cuda.get_device_capability(device) != (7, 0):
+        return "non_sm70"
+    reason = metadata_reject_reason(sampling_metadata, num_reqs)
+    if reason is not None:
+        return reason
+    reason = argmax_invariant_reject_reason(sampling_metadata)
+    if reason is not None:
+        return reason
+    if not ops_available():
+        return "missing_ops"
+    return None
+
+
+def lm_head_topk_candidates(
+    logits_processor: "LogitsProcessor",
+    lm_head: "VocabParallelEmbedding",
+    hidden_states: torch.Tensor,
+) -> torch.Tensor | None:
+    """Rank-local top-32 logits of every TP rank for top-k sampling.
+
+    Returns rank-major FP32 rows ``[tp_size * rows, 64]`` (32 values, then
+    32 global token ids) for ``sample_topk_candidates``, or None before any
+    collective when the shard does not qualify. The decision depends only on
+    shapes and configuration, so every rank takes the same branch.
+    """
+    shard = lm_head.shard_indices
+    if (
+        logits_processor.soft_cap is not None
+        or logits_processor.scale != 1.0
+        or shard.num_added_elements != 0
+        or lm_head.weight.dtype != torch.float16
+    ):
+        return None
+    logits = lm_head.quant_method.apply(lm_head, hidden_states, bias=None)
+    wire = local_topk_candidates(
+        logits,
+        vocab_start=shard.org_vocab_start_index,
+        num_valid=shard.num_org_elements,
+    )
+    if wire is not None and get_tensor_model_parallel_world_size() > 1:
+        wire = tensor_model_parallel_all_gather(wire, dim=0)
+    return wire
+
+
+def sample_lm_head_candidates(
+    logits_processor: "LogitsProcessor",
+    lm_head: "VocabParallelEmbedding",
+    hidden_states: torch.Tensor,
+    sampling_metadata: SamplingMetadata,
+    *,
+    vocab_size: int,
+) -> torch.Tensor | None:
+    """Sample admitted rows from the LM head's vocab-parallel candidates.
+
+    Returns int32 token ids [rows], or None when the shard or tensors do not
+    qualify (the caller then runs the full-vocabulary sampler).
+    """
+    wire = lm_head_topk_candidates(logits_processor, lm_head, hidden_states)
+    if wire is None:
+        return None
+    sampled = sample_topk_candidates(
+        wire,
+        sampling_metadata,
+        tp_size=get_tensor_model_parallel_world_size(),
+        vocab_size=vocab_size,
+    )
+    if sampled is not None:
+        logger.info_once("SM70 top-k candidate sampler enabled.")
+    return sampled
 
 
 def local_topk_candidates(

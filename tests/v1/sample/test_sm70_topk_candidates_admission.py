@@ -5,9 +5,13 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
 
+from vllm.v1.sample.logits_processor.builtin import MinPLogitsProcessor
 from vllm.v1.sample.ops.sm70_topk_candidates import (
     MAX_TOP_K,
+    admission_reject_reason,
+    argmax_invariant_reject_reason,
     metadata_reject_reason,
 )
 
@@ -73,3 +77,35 @@ def test_one_seeded_request_is_admitted():
 def test_rejections(rows, overrides, reason):
     meta = _metadata(max(rows, 1), **overrides)
     assert metadata_reject_reason(meta, rows) == reason
+
+
+def _min_p(count):
+    processor = object.__new__(MinPLogitsProcessor)
+    processor.min_p_count = count
+    return processor
+
+
+def _with_argmax_invariant(*processors):
+    return SimpleNamespace(
+        logitsprocs=SimpleNamespace(argmax_invariant=list(processors))
+    )
+
+
+@pytest.mark.parametrize(
+    "processors,reason",
+    [
+        ((), None),
+        ((_min_p(0),), None),
+        ((_min_p(1),), "argmax_invariant_logits_processor"),
+        ((object(),), "argmax_invariant_logits_processor"),
+        ((_min_p(0), object()), "argmax_invariant_logits_processor"),
+    ],
+)
+def test_argmax_invariant_processors(processors, reason):
+    meta = _with_argmax_invariant(*processors)
+    assert argmax_invariant_reject_reason(meta) == reason
+
+
+def test_non_cuda_device_is_rejected_first():
+    meta = _metadata(3)
+    assert admission_reject_reason(meta, 3, torch.device("cpu")) == "non_cuda"
