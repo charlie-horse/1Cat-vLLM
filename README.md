@@ -21,8 +21,9 @@ V100:
 
 - **Model and checkpoint.** `vllm/models/flint/` holds the model and a
   converter from the published NVFP4 GGUF to a ModelOpt W4A16 NVFP4
-  checkpoint (FP16 activations; V100 has no BF16). The converter applies an
-  FP16 overflow rescale so the MoE and the late-layer residual stay in range.
+  checkpoint (FP16 activations; V100 has no BF16). When the weights load,
+  the model rescales the MoE and late-layer residual scales so they stay in
+  FP16 range.
 - **Attention.** A grouped-query paged decode kernel for the sink layers in
   the Flash-V100 backend.
 - **Single-token NVFP4 kernels.** At decode batch 1–2 the dense projections

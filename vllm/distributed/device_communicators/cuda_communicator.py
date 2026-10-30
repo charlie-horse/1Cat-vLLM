@@ -472,6 +472,39 @@ class CudaCommunicator(DeviceCommunicatorBase):
             input_, residual, weight, epsilon
         )
 
+    def tp2_all_reduce_fused_add_rms_norm(
+        self,
+        input_: torch.Tensor,
+        input_b: torch.Tensor | None,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        epsilon: float,
+        scale: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``fused_add_rms_norm(all_reduce(input_ + input_b) * scale, ...)``.
+
+        The custom TP2 collective fuses the whole chain for decode-sized
+        inputs. Anything else (prefill rows, a disabled custom all-reduce)
+        runs the unfused ops, unchanged.
+        """
+        ca_comm = self.ca_comm
+        if (
+            self.use_custom_allreduce
+            and ca_comm is not None
+            and ca_comm.can_tp2_all_reduce_fused_add_rms_norm(
+                input_, input_b, residual, weight
+            )
+        ):
+            return ca_comm.tp2_all_reduce_fused_add_rms_norm(
+                input_, input_b, residual, weight, epsilon, scale
+            )
+        from vllm import ir
+
+        reduced = self.all_reduce(input_ if input_b is None else input_ + input_b)
+        if scale != 1.0:
+            reduced = reduced * scale
+        return ir.ops.fused_add_rms_norm(reduced, residual, weight, epsilon)
+
     def sm70_tp4_all_reduce_gemma_rms_norm(
         self,
         input_: torch.Tensor,

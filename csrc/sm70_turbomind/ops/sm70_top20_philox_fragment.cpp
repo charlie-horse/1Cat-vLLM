@@ -31,6 +31,15 @@ void sm70_sample_chunked_top20_philox_token_out(
     const std::optional<at::Generator>& generator, int64_t vocab_size,
     double top_p, int64_t chunk_size);
 
+torch::Tensor sm70_local_top32_half(torch::Tensor logits, int64_t vocab_start,
+                                    int64_t num_valid);
+
+torch::Tensor sm70_sample_topk_candidates(
+    torch::Tensor wire, torch::Tensor temperature, torch::Tensor top_k,
+    const std::optional<torch::Tensor>& top_p,
+    const std::optional<at::Generator>& generator, int64_t vocab_size,
+    int64_t tp_size, const std::optional<torch::Tensor>& overflow);
+
 // Keep these registrations in a wheel-safe sidecar. Adding the sampler must
 // not relink or perturb the speed- and quality-frozen primary vllm._C module;
 // Python loads this fragment only for the explicitly admitted SM70 route.
@@ -69,4 +78,16 @@ TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "float top_p, int chunk_size) -> ()");
   ops.impl("sm70_sample_chunked_top20_philox_token_out", torch::kCUDA,
            &sm70_sample_chunked_top20_philox_token_out);
+
+  ops.def(
+      "sm70_local_top32_half(Tensor logits, int vocab_start, int num_valid) "
+      "-> Tensor");
+  ops.impl("sm70_local_top32_half", torch::kCUDA, &sm70_local_top32_half);
+
+  ops.def(
+      "sm70_sample_topk_candidates(Tensor wire, Tensor temperature, "
+      "Tensor top_k, Tensor? top_p, Generator? generator, int vocab_size, "
+      "int tp_size, Tensor(a!)? overflow) -> Tensor");
+  ops.impl("sm70_sample_topk_candidates", torch::kCUDA,
+           &sm70_sample_topk_candidates);
 }

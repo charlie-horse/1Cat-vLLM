@@ -77,6 +77,7 @@ CONFIGURED_OPERATORS = GGUF_OPERATORS + (
     "nvfp4_gemv_sm70_raw_out",
     "nvfp4_gemv_sm70_warp_out",
     "nvfp4_glm53_moe_q8_qpn_sm70_out",
+    "nvfp4_moe_decode_fused_sm70_out",
     "nvfp4_moe_decode_w2_reduce_sm70_out",
     "nvfp4_moe_decode_w13_swiglu_sm70_out",
     "nvfp4_moe_dense_stage_sm70_out",

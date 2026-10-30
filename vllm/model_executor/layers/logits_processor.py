@@ -283,12 +283,16 @@ class LogitsProcessor(PluggableLayer):
         lm_head: VocabParallelEmbedding,
         hidden_states: torch.Tensor,
         embedding_bias: torch.Tensor | None = None,
+        *,
+        fused_top1: bool = True,
     ) -> torch.Tensor:
         """Vocab-parallel argmax without all-gathering full logits.
 
         Each TP rank computes local argmax, then only the (value, index) pairs
         are gathered and reduced. Communication: O(batch * 2 * tp_size) vs
-        O(batch * vocab_size).
+        O(batch * vocab_size). ``fused_top1=False`` keeps the argmax on the
+        logits of the regular LM-head GEMM instead of the SM70 fused
+        projection-plus-argmax kernels, whose FP16 products differ.
         """
         if self.scale <= 0.0 and self.scale != 1.0:
             raise ValueError(
@@ -300,15 +304,18 @@ class LogitsProcessor(PluggableLayer):
         local_pair = None
         pair_getter = getattr(lm_head, "maybe_get_sm70_lm_head_top1_pair", None)
         if (
-            pair_getter is not None
+            fused_top1
+            and pair_getter is not None
             and tp_size > 1
             and self.soft_cap is None
             and self.scale == 1.0
         ):
             local_pair = pair_getter(hidden_states, embedding_bias)
         if local_pair is None:
-            local_top1 = lm_head.maybe_get_sm70_lm_head_top1(
-                hidden_states, embedding_bias
+            local_top1 = (
+                lm_head.maybe_get_sm70_lm_head_top1(hidden_states, embedding_bias)
+                if fused_top1
+                else None
             )
             if local_top1 is None:
                 logits = lm_head.quant_method.apply(
@@ -366,6 +373,39 @@ class LogitsProcessor(PluggableLayer):
             lm_head, hidden_states, embedding_bias, top_tokens
         )
         return top_tokens
+
+    def get_topk_candidates(
+        self,
+        lm_head: VocabParallelEmbedding,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Rank-local top-32 logits of every TP rank for top-k sampling.
+
+        Returns rank-major FP32 rows ``[tp_size * rows, 64]`` (32 values, then
+        32 global token ids) for ``sm70_topk_candidates.sample_topk_candidates``,
+        or None before any collective when the shard does not qualify. The
+        decision depends only on shapes and configuration, so every rank
+        takes the same branch.
+        """
+        from vllm.v1.sample.ops import sm70_topk_candidates
+
+        shard = lm_head.shard_indices
+        if (
+            self.soft_cap is not None
+            or self.scale != 1.0
+            or shard.num_added_elements != 0
+            or lm_head.weight.dtype != torch.float16
+        ):
+            return None
+        logits = lm_head.quant_method.apply(lm_head, hidden_states, bias=None)
+        wire = sm70_topk_candidates.local_topk_candidates(
+            logits,
+            vocab_start=shard.org_vocab_start_index,
+            num_valid=shard.num_org_elements,
+        )
+        if wire is not None and get_tensor_model_parallel_world_size() > 1:
+            wire = tensor_model_parallel_all_gather(wire, dim=0)
+        return wire
 
     def get_topk_tokens_and_logprobs(
         self,

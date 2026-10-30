@@ -64,6 +64,10 @@ DYNAMIC_DOMAINS = {
         "initialization",
         "KernelConfig.sm70_rmsnorm_gated_aliases at the layer admission checkpoint",
     ),
+    ("vllm/config/kernel.py", "KernelConfig.resolve_flint_qk_rope_kv"): (
+        "initialization",
+        "KernelConfig.sm70_flint_qk_rope_kv_aliases; layers read the resolved field",
+    ),
     ("vllm/config/legacy_inputs.py", "LegacyInputs.capture"): (
         "initialization",
         (
@@ -427,6 +431,7 @@ COMPATIBILITY_CONSUMERS = {
         "share_workspace",
         "dual_cta",
         "padded_smem",
+        "sink_fused_decode",
     },
     "vllm/config/diagnostic_sampling.py": {"legacy_rejection_profile"},
     "vllm/config/sm70_dflash2.py": {"dflash2_bf16_emulation"},
@@ -469,6 +474,7 @@ CONFIG_INITIALIZERS = {
     "GdnProfileConfig.resolve",
     "GdnStateTraceConfig.resolve",
     "KernelConfig.resolve_sm70_rmsnorm_gated",
+    "KernelConfig.resolve_flint_qk_rope_kv",
     "resolve_legacy_fields",
 }
 

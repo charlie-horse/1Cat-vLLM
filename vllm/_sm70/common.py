@@ -118,6 +118,10 @@ def has_nvfp4_moe_decode_dispatch() -> bool:
     )
 
 
+def has_nvfp4_moe_decode_fused_dispatch() -> bool:
+    return hasattr(torch.ops._C, "nvfp4_moe_decode_fused_sm70_out")
+
+
 def has_nvfp4_qpn_w2_reduce_dispatch() -> bool:
     return hasattr(
         torch.ops._C_qwen38,

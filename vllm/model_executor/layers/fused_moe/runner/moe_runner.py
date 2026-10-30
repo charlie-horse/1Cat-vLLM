@@ -39,6 +39,10 @@ from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
 from vllm.model_executor.layers.fused_moe.router.fused_moe_router import (
     FusedMoERouter,
 )
+from vllm.model_executor.layers.fused_moe.router.sm70_flint_router import (
+    FlintFusedRouter,
+    admit_flint_fused_router,
+)
 from vllm.model_executor.layers.fused_moe.router.zero_expert_router import (
     ZeroExpertRouter,
 )
@@ -356,6 +360,9 @@ class MoERunner(MoERunnerInterface):
                 attach_route_recorder(self.router, layer_name, parameter.device)
 
         self._forward_entry = self._select_forward()
+        # Fused E256/K6 decode router: per-layer state once admitted.
+        self._flint_fused_router: FlintFusedRouter | None = None
+        self._flint_fused_router_decided = False
 
     def _select_forward(self) -> Callable:
         if current_platform.is_tpu() or current_platform.is_cpu():
@@ -396,6 +403,24 @@ class MoERunner(MoERunnerInterface):
 
     def is_internal_router(self) -> bool:
         return self.gate is not None
+
+    def _maybe_flint_fused_route(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Gate and top-k in one kernel for one or two tokens.
+
+        Admission is decided once per layer, outside graph capture; each call
+        checks tensor metadata only, so a captured graph has no data branch.
+        """
+        if not self._flint_fused_router_decided:
+            if torch.cuda.is_current_stream_capturing():
+                # The workspace must not come from a graph pool.
+                return None
+            self._flint_fused_router = admit_flint_fused_router(self)
+            self._flint_fused_router_decided = True
+        if self._flint_fused_router is None:
+            return None
+        return self._flint_fused_router.try_route(hidden_states)
 
     def apply_routed_input_transform(
         self, hidden_states: torch.Tensor
@@ -648,6 +673,7 @@ class MoERunner(MoERunnerInterface):
         router_logits: torch.Tensor,
         shared_experts_input: torch.Tensor | None,
         input_ids: torch.Tensor | None = None,
+        precomputed_topk: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor]:
         """Run expert routing and the fused MoE kernel via the quant method.
 
@@ -667,11 +693,14 @@ class MoERunner(MoERunnerInterface):
                 input_ids=input_ids,
             )
         else:
-            topk_weights, topk_ids = self.router.select_experts(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                input_ids=input_ids,
-            )
+            if precomputed_topk is not None:
+                topk_weights, topk_ids = precomputed_topk
+            else:
+                topk_weights, topk_ids = self.router.select_experts(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    input_ids=input_ids,
+                )
             topk_weights = _sm70_dump_moe_runner_tensor(
                 topk_weights,
                 "moe_topk_weights",
@@ -1017,7 +1046,12 @@ class MoERunner(MoERunnerInterface):
         # If the Runner holds the gate, apply it after the stream sync,
         # so it can run overlapped with the
         # NOTE: in future PR, MoE runner will always hold the gate.
-        if self.gate is not None:
+        precomputed_topk = (
+            self._maybe_flint_fused_route(hidden_states)
+            if self.gate is not None
+            else None
+        )
+        if self.gate is not None and precomputed_topk is None:
             if self._fse_fuse_gate:
                 self._maybe_fuse_gate_weights()
                 router_logits = F.linear(hidden_states, self._combined_gate_weight)
@@ -1045,6 +1079,7 @@ class MoERunner(MoERunnerInterface):
                 router_logits=router_logits,
                 shared_experts_input=shared_experts_input,
                 input_ids=input_ids,
+                precomputed_topk=precomputed_topk,
             )
 
             return self._maybe_combine(

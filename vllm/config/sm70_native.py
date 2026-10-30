@@ -542,6 +542,7 @@ def compile_ignored_aliases(kernel) -> set[str]:
     ignored.update(FP8_STAGE_ALIASES.values())
     ignored.update(FP8_COMPACT_ALIASES.values())
     ignored.update(kernel.sm70_rmsnorm_gated_aliases.values())
+    ignored.update(kernel.sm70_flint_qk_rope_kv_aliases.values())
     ignored.add("VLLM_SM70_QWEN38_QPN_ROUTE_DEBUG")
     return ignored
 

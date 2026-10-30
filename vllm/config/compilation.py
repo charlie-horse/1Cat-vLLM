@@ -135,6 +135,10 @@ class PassConfig:
     """Enable async TP."""
     fuse_allreduce_rms: bool = None  # type: ignore[assignment]
     """Enable flashinfer allreduce fusion."""
+    fuse_allreduce_add_rms_tp2: bool = False
+    """With `fuse_allreduce_rms`, replace TP2 FP16 hidden-2048 custom
+    all-reduces that feed `fused_add_rms_norm` with one fused collective.
+    Requested by a model's config hook, not by optimization levels."""
     fuse_minimax_qk_norm: bool = None  # type: ignore[assignment]
     """Deprecated. The MiniMax QK norm fusion is now applied automatically at
     runtime (see `MiniMaxText01RMSNormTP.forward_qkv`). This flag is kept for
@@ -1165,6 +1169,9 @@ class CompilationConfig:
                         self.pass_config.fuse_rope_kvcache = False
                     self.splitting_ops.append("vllm::unified_kv_cache_update")
                     self.splitting_ops.append("vllm::unified_mla_kv_cache_update")
+                    # Same reason: the fused q/k norm + RoPE + KV-cache update
+                    # op takes the layer name too.
+                    self.splitting_ops.append("vllm::qk_norm_rope_kv_cache_update")
 
             elif len(self.splitting_ops) == 0:
                 if (

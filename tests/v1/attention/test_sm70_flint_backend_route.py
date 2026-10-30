@@ -185,6 +185,8 @@ def _vllm_config(
         ),
         cache_config=SimpleNamespace(cache_dtype=cache_dtype),
         speculative_config=speculative_config,
+        # TP1: the TP2 all-reduce + RMSNorm fusion stays off.
+        parallel_config=SimpleNamespace(tensor_parallel_size=1),
     )
 
 

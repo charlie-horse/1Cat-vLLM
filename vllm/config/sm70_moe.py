@@ -470,6 +470,7 @@ NVFP4_ALIASES = {
     "glm53_fused_permute": "VLLM_SM70_GLM53_MOE_FUSED_PERMUTE_Q8",
     "glm53_qpn_w13": "VLLM_SM70_GLM53_MOE_QPN_W13_Q8",
     "flint_qpn_decode": "VLLM_SM70_FLINT_MOE_QPN_DECODE",
+    "flint_persistent_decode": "VLLM_SM70_FLINT_MOE_PERSISTENT",
 }
 
 MXFP4_ALIASES = {
@@ -583,6 +584,8 @@ class Sm70NvFp4MoEConfig(Sm70MoELegacyConfig):
     """Initialization override for VLLM_SM70_GLM53_MOE_QPN_W13_Q8."""
     flint_qpn_decode: bool | None = None
     """Initialization override for VLLM_SM70_FLINT_MOE_QPN_DECODE."""
+    flint_persistent_decode: bool | None = None
+    """Initialization override for VLLM_SM70_FLINT_MOE_PERSISTENT (default off)."""
     route_debug: bool | None = None
     """Historical Qwen route diagnostic, excluded from the calculation hash."""
 
@@ -656,10 +659,13 @@ class Sm70MoERoutingPolicy(DeferredExecutionPolicy):
     """Enable the retained E512/K10 exact router at dynamic M1..16."""
     mtp_top16: bool | None = None
     """Use partial selection at the existing FP16 M5/M10 gates."""
+    flint_fused: bool | None = None
+    """Fused FP32-gate E256/K6 sigmoid router for one or two tokens."""
 
     aliases: ClassVar[dict[str, str]] = {
         "exact_topk": "VLLM_SM70_QWEN38_ROUTER_TOPK",
         "mtp_top16": "VLLM_SM70_MTP_ROUTER_TOP16",
+        "flint_fused": "VLLM_SM70_FLINT_FUSED_ROUTER",
     }
 
 

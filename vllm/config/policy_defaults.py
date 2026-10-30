@@ -327,6 +327,7 @@ def finalize_runtime_policy_hashes(cfg):
             or (pre_ampere and field.startswith("awq_") and tp == 2)
             or (pre_ampere and field == "top1_custom_ar" and tp > 1)
             or (pre_ampere and field == "gemma_rms_tp2" and tp == 2)
+            or (pre_ampere and field == "ar_add_rms_tp2" and tp == 2)
             or (field in ("symm_mem", "flashinfer") and tp > 1)
         )
     )

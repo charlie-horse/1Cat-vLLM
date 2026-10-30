@@ -352,6 +352,7 @@ if TYPE_CHECKING:
     VLLM_SM70_NVFP4_QWEN38_TP4_M1_FAST_SELECTOR: bool = True
     VLLM_SM70_NVFP4_QWEN38_MOE_QPN_M1_DECODE: bool = True
     VLLM_SM70_FLINT_MOE_QPN_DECODE: bool = True
+    VLLM_SM70_FLINT_MOE_PERSISTENT: bool = False
     VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_DECODE: bool = True
     VLLM_SM70_NVFP4_QWEN38_MOE_QPN_DYNAMIC_DECODE: bool = False
     VLLM_SM70_NVFP4_MOE_GROUPED_DECODE: bool = False
@@ -366,6 +367,7 @@ if TYPE_CHECKING:
     VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE: bool = True
     VLLM_SM70_NVFP4_QPN_M1_LIBRARY: str | None = None
     VLLM_SM70_QWEN38_ROUTER_TOPK: bool = True
+    VLLM_SM70_FLINT_FUSED_ROUTER: bool = True
     VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE: bool = False
     VLLM_SM70_AWQ_WARMUP: bool = True
     VLLM_SM70_AWQ_WARMUP_MAX_M: int = 16
@@ -440,6 +442,7 @@ if TYPE_CHECKING:
     VLLM_SM70_COMPACT_TOPK20_SAMPLER: bool = False
     VLLM_SM70_CHUNKED_TOPK20_CHUNKS: int = 0
     VLLM_SM70_TP_LOCAL_TOPK20_SAMPLER: bool = False
+    VLLM_SM70_FLINT_SAMPLER: bool = True
     VLLM_SM70_TOPK_TOPP_8_WARPS: bool = False
     VLLM_SM70_TOPK_TOPP_B8_B16_8_WARPS: bool = True
     VLLM_SM70_ASYNC_SCHEDULING_QUEUE_DEPTH: int = 0
@@ -561,9 +564,11 @@ if TYPE_CHECKING:
     VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL: bool = True
     VLLM_SM70_NVFP4_MOE_GROUPED_EXPERT_ROWS: bool = False
     VLLM_SM70_NVFP4_DENSE_GATED_SILU: bool = True
+    VLLM_SM70_FLINT_QK_ROPE_KV: bool = True
     VLLM_SM70_NVFP4_QPN4: bool = True
     VLLM_SM70_NVFP4_QPN4_DOWN_SCALE_CODE: bool = False
     VLLM_SM70_MODELOPT_NVFP4_GEMV: bool = True
+    VLLM_SM70_FLINT_AR_RMSNORM: bool = True
     VLLM_SM70_MXFP4_TURBOMIND: bool = True
     VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_B1: bool = False
     VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_MAX_TOKENS: int = 8
@@ -681,6 +686,7 @@ if TYPE_CHECKING:
     VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL: bool = True
     VLLM_FLASH_V100_PREFILL_SCORE_BLOCK_TOKENS: int = 8192
     VLLM_FLASH_V100_SHARE_DECODE_WORKSPACE: bool = True
+    VLLM_SM70_FLINT_ATTN_FUSED_DECODE: bool = True
     VLLM_DFLASH_COMPACT_AUX_HIDDEN: bool = True
     VLLM_FLASH_V100_PREFILL_D256_GQA_V37: bool = False
     VLLM_FLASH_V100_PREFILL_SPLIT_KV: bool = False
@@ -5086,6 +5092,29 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=("TurboMind NVFP4",),
         user_visible=False,
     ),
+    # Single-launch form of the Flint M<=2 routed-expert decode above: W2
+    # blocks load their weights while W13 runs and wait on a device-side flag,
+    # bitwise equal to the two launches. Off by default (no measured gain);
+    # "1" opts in.
+    "VLLM_SM70_FLINT_MOE_PERSISTENT": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_FLINT_MOE_PERSISTENT", "0"))),
+        description=(
+            "Run the Flint NVFP4 TP2 M<=2 routed-expert decode as one launch: "
+            "W2 blocks prefetch their weights while W13 runs and wait on a "
+            "device-side flag for the SwiGLU activations. Same arithmetic and "
+            "bitwise-identical output as the two-kernel decode. Applies only "
+            "where VLLM_SM70_FLINT_MOE_QPN_DECODE admits a layer. Off by "
+            "default: on a V100 (CUDA graph, cold L2) it measured 19.07 vs "
+            "18.44 us per layer at M=1 and 27.39 vs 27.52 us at M=2 against "
+            "the two launches. Set to 1 to opt in."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind NVFP4",),
+        user_visible=False,
+    ),
     # Direct Qwen3.8 expert route for CUDA Graph local widths 2, 4, 8, and 16. It
     # retains native NVFP4 weights, FP16 activations, and FP32 accumulation
     # while skipping expert sort and input expansion. Exact shape/capability
@@ -5356,6 +5385,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "Exact single-token E=512, K=10 softmax router used by Qwen3.8 "
             "Flash Next. All other shapes and scoring modes retain the generic"
             " CUDA op."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
+    ),
+    # Fused decode router for the E256/K6 sigmoid MoE with an FP32 gate
+    # [256, 2048] at one or two tokens: FP16 input, FP32 accumulation and
+    # topk_sigmoid's selection in one launch. "0" keeps the FP32 GEMM route.
+    "VLLM_SM70_FLINT_FUSED_ROUTER": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_FLINT_FUSED_ROUTER", "1"))),
+        description=(
+            "Fused SM70 decode router for the E256/K6 renormalized sigmoid "
+            "MoE with an FP32 gate [256, 2048] at one or two tokens: one "
+            "kernel reads the FP16 hidden states and the FP32 gate, "
+            "accumulates in FP32 and selects the top six with topk_sigmoid's "
+            "arithmetic. Set to 0 to keep the FP32 GEMM and topk_sigmoid."
         ),
         category="configuration",
         declared_default="True",
@@ -8567,6 +8615,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=("TurboMind NVFP4",),
         user_visible=False,
     ),
+    # Flint attention on SM70: one Triton kernel for the per-head q/k
+    # RMSNorm, the NeoX RoPE and the FP16 paged KV-cache write. Set to 0 to
+    # run the separate norm, RoPE and cache-write kernels.
+    "VLLM_SM70_FLINT_QK_ROPE_KV": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_FLINT_QK_ROPE_KV", "1"))),
+        description=(
+            "SM70: Flint fused q/k RMSNorm, RoPE and FP16 paged KV-cache "
+            "write. Set to 0 to run the separate kernels."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
+    ),
     # Memory-neutral native QPN4 M=1 decode for the accepted Qwen3.8-27B
     # NVFP4 TP4 no-MTP contract. Larger-M prefill dequantizes into one bounded
     # shared FP16 workspace. Set to 0 to retain the TurboMind NVFP4 route.
@@ -8616,6 +8680,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=("TurboMind NVFP4",),
         user_visible=False,
     ),
+    # Flint SM70 TP2: fuse the custom all-reduce with the fused_add_rms_norm
+    # that follows it (residual add + RMSNorm in the collective's epilogue,
+    # bitwise equal). Set to 0 to keep the separate norm kernels.
+    "VLLM_SM70_FLINT_AR_RMSNORM": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_FLINT_AR_RMSNORM", "1"))),
+        description=(
+            "Flint on SM70 TP2: fuse each hidden-state custom all-reduce with "
+            "the residual add and RMSNorm that follow it (one kernel, bitwise "
+            "equal outputs) through the all-reduce + RMSNorm compile pass. "
+            "Set to 0 to keep the separate fused_add_rms_norm kernels."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 TP2 all-reduce + fused_add_rms_norm",),
+        user_visible=False,
+    ),
     # Exact no-MTP random sampler for the Qwen3.8 TP4 batch-one contract.
     # The base flag enables exact compact sampling after full-logits gather.
     # The separate TP-local flag opts into rank-local top-20 reduction.
@@ -8656,6 +8738,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="configuration",
         declared_default="False",
         effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
+    ),
+    # Flint on SM70: sample from vocab-parallel candidates instead of the
+    # full-vocabulary logits (greedy argmax pairs; rank-local top-32 logits
+    # for top-k <= 20 random sampling without logprobs or penalties).
+    "VLLM_SM70_FLINT_SAMPLER": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_FLINT_SAMPLER", "1"))),
+        description=(
+            "SM70 Flint: sample from vocab-parallel candidates. Greedy batches "
+            "exchange per-rank argmax pairs; random batches with top-k <= 20 "
+            "and no logprobs, penalties or logits processors exchange each "
+            "rank's top-32 logits and sample them with the reference top-k/"
+            "top-p semantics and the same Philox draws. Set 0 to gather the "
+            "full logits and use the regular sampler."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
         user_visible=False,
@@ -10399,6 +10501,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
         lambda: os.getenv("VLLM_FLASH_V100_SHARE_DECODE_WORKSPACE", "1") != "0",
         description=(
             "Reuse decode scratch across row capacities on the same CUDA stream."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
+    ),
+    # Decode grouped GQA-8 D128 sink layers in one launch per layer.
+    "VLLM_SM70_FLINT_ATTN_FUSED_DECODE": env_var(
+        lambda: os.getenv("VLLM_SM70_FLINT_ATTN_FUSED_DECODE", "1") != "0",
+        description=(
+            "Decode grouped GQA-8 D128 sink layers in one launch per layer: "
+            "the partition grid fills the device once instead of covering the "
+            "captured context envelope, and the last CTA of each KV head "
+            "applies the sinks and writes the output. Set to 0 to restore the "
+            "partition kernel plus reducer."
         ),
         category="configuration",
         declared_default="True",

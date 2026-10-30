@@ -397,6 +397,119 @@ def test_decode_sinks_cuda_graph_replay(sm70, window):
         torch.testing.assert_close(out.float(), expected, rtol=RTOL, atol=ATOL)
 
 
+FUSED_ENV = "VLLM_SM70_FLINT_ATTN_FUSED_DECODE"
+
+
+@pytest.fixture
+def sm70_fused(sm70):
+    _, interface = sm70
+    if not hasattr(interface.flash_attn_v100_cuda, "decode_paged_sinks_fused_fwd"):
+        pytest.skip("flash_attn_v100 was built without the fused sink decode")
+    return sm70
+
+
+@WINDOWS
+@HEADS
+@pytest.mark.parametrize(
+    "seq_lens",
+    [[1], [63, 64, 65], [255, 256, 257, 513, 514], [3000, 70], [4096], [65536]],
+    ids=["one", "min-chunk", "edges", "mixed", "4k", "64k"],
+)
+@pytest.mark.parametrize("capacity", [None, 262144], ids=["eager", "envelope"])
+@torch.inference_mode()
+def test_decode_sinks_fused_matches_two_launches(
+    sm70_fused, monkeypatch, window, heads, seq_lens, capacity
+):
+    """One launch per layer against the partition kernel plus reducer.
+
+    ``capacity`` reproduces the server's capture hints (a 262K workspace
+    envelope): the fused grid fills the device and the last CTA reduces many
+    partials. Both routes round partials to fp16, so they agree to a couple
+    of fp16 ulps, and both match the FP32 reference.
+    """
+    device, interface = sm70_fused
+    num_heads, num_kv_heads = heads
+    k_cache, v_cache, block_table = _paged_kv(
+        seq_lens, num_kv_heads, 16, device, seed=91 + len(seq_lens)
+    )
+    q = _query(len(seq_lens), num_heads, device, seed=92)
+    lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+    sinks = _sinks(num_heads, device, seed=93)
+    kw = {"max_seq_len_hint": max(seq_lens), "sinks": sinks}
+    if capacity is not None:
+        kw["workspace_seq_capacity_hint"] = capacity
+        kw["partition_size_hint"] = 256
+    monkeypatch.setenv(FUSED_ENV, "0")
+    two = _decode(interface, q, k_cache, v_cache, block_table, lens, window, **kw)
+    monkeypatch.setenv(FUSED_ENV, "1")
+    fused = _decode(interface, q, k_cache, v_cache, block_table, lens, window, **kw)
+    # Repeat: the arrival counters must be back at zero after each launch.
+    again = _decode(interface, q, k_cache, v_cache, block_table, lens, window, **kw)
+    torch.testing.assert_close(fused, two, rtol=GROUPED_RTOL, atol=GROUPED_ATOL)
+    assert torch.equal(fused, again)
+    expected = _reference(q, k_cache, v_cache, block_table, lens, window, sinks)
+    torch.testing.assert_close(fused.float(), expected, rtol=RTOL, atol=ATOL)
+
+
+@WINDOWS
+@torch.inference_mode()
+def test_decode_sinks_fused_cuda_graph_server_envelope(sm70_fused, window):
+    """The server's capture: hint 1, a 262K envelope, replays at any length.
+
+    Replays must follow new lengths in both directions (the grid never
+    depends on them), stay bit-stable on repeat, and keep the empty row zero.
+    """
+    device, interface = sm70_fused
+    capacity = 262144
+    k_cache, v_cache, block_table = _paged_kv([40000, 40000], 2, 16, device, seed=95)
+    q = _query(2, 16, device, seed=96)
+    lens = torch.ones(2, dtype=torch.int32, device=device)
+    active = torch.ones(1, dtype=torch.int32, device=device)
+    sinks = _sinks(16, device, seed=97)
+    out = torch.empty_like(q)
+
+    def run():
+        _decode(
+            interface,
+            q,
+            k_cache,
+            v_cache,
+            block_table,
+            lens,
+            window,
+            out=out,
+            max_seq_len_hint=1,
+            workspace_seq_capacity_hint=capacity,
+            active_num_partitions=active,
+            partition_size_hint=256,
+            sinks=sinks,
+        )
+
+    side = torch.cuda.Stream(device)
+    side.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(side):
+        run()
+    torch.cuda.current_stream(device).wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+
+    for step, new_lens in enumerate(
+        ([4096, 513], [40000, 1], [600, 0], [32768, 4097], [65, 40000])
+    ):
+        q.copy_(_query(2, 16, device, seed=100 + step))
+        lens.copy_(torch.tensor(new_lens, dtype=torch.int32))
+        active.fill_(max(1, math.ceil(max(new_lens) / 256)))
+        graph.replay()
+        torch.accelerator.synchronize()
+        first = out.clone()
+        graph.replay()
+        torch.accelerator.synchronize()
+        assert torch.equal(out, first)
+        expected = _reference(q, k_cache, v_cache, block_table, lens, window, sinks)
+        torch.testing.assert_close(out.float(), expected, rtol=RTOL, atol=ATOL)
+
+
 @torch.inference_mode()
 def test_decode_sinks_dominant_sink_stays_finite(sm70):
     """A sink far above every score must not overflow the denominator."""
@@ -426,12 +539,16 @@ def test_decode_sinks_dominant_sink_stays_finite(sm70):
 
 
 class _Native(ModuleType):
-    def __init__(self, *, with_sinks: bool = True):
+    def __init__(self, *, with_sinks: bool = True, with_fused: bool = False):
         super().__init__("flash_attn_v100.flash_attn_v100_cuda")
         self.calls: list[tuple[str, tuple]] = []
         self.decode_paged_fwd = self._record("decode_paged_fwd")
         if with_sinks:
             self.decode_paged_sinks_fwd = self._record("decode_paged_sinks_fwd")
+        if with_fused:
+            self.decode_paged_sinks_fused_fwd = self._record(
+                "decode_paged_sinks_fused_fwd"
+            )
 
     def _record(self, name):
         def call(*args):
@@ -454,9 +571,10 @@ def _import_interface(monkeypatch, native: _Native):
 def cpu_interface(monkeypatch):
     before = set(sys.modules)
     monkeypatch.delenv("VLLM_FLASH_V100_DECODE_PARTITION_SIZE", raising=False)
+    monkeypatch.delenv(FUSED_ENV, raising=False)
 
-    def load(with_sinks: bool = True):
-        native = _Native(with_sinks=with_sinks)
+    def load(with_sinks: bool = True, with_fused: bool = False):
+        native = _Native(with_sinks=with_sinks, with_fused=with_fused)
         return _import_interface(monkeypatch, native), native
 
     yield load
@@ -496,6 +614,74 @@ def test_interface_sinks_take_the_sink_entry_point(cpu_interface):
     assert len(args) == 21 and args[-1] is sinks
     assert args[16:18] == SWA_WINDOW
     assert interface.flash_attn_decode_paged_sinks_available()
+
+
+def test_interface_grouped_sinks_take_the_fused_entry_point(cpu_interface):
+    interface, native = cpu_interface(with_fused=True)
+    q, k, v, table, lens = _cpu_inputs()
+    sinks = torch.zeros(16, dtype=torch.float32)
+    for _ in range(2):
+        interface.flash_attn_decode_paged(
+            q, k, v, table, lens, window_size=SWA_WINDOW, sinks=sinks
+        )
+    assert [name for name, _ in native.calls] == ["decode_paged_sinks_fused_fwd"] * 2
+    (_, first), (_, second) = native.calls
+    assert len(first) == 22 and first[20] is sinks
+    counters = first[21]
+    # One zeroed int32 counter per (row, head) at least, reused across calls
+    # (graph replays keep its address) together with the shared workspace.
+    assert counters.dtype == torch.int32 and counters.is_contiguous()
+    assert counters.numel() >= q.shape[0] * k.shape[2]
+    assert torch.count_nonzero(counters) == 0
+    assert second[21] is counters
+    assert first[6].data_ptr() == second[6].data_ptr()
+
+
+def test_interface_fused_decode_kill_switch(cpu_interface, monkeypatch):
+    monkeypatch.setenv(FUSED_ENV, "0")
+    interface, native = cpu_interface(with_fused=True)
+    q, k, v, table, lens = _cpu_inputs()
+    sinks = torch.zeros(16, dtype=torch.float32)
+    interface.flash_attn_decode_paged(q, k, v, table, lens, sinks=sinks)
+    ((name, args),) = native.calls
+    assert name == "decode_paged_sinks_fwd" and len(args) == 21
+
+
+@pytest.mark.parametrize(
+    ("heads", "kwargs"),
+    [
+        ((16, 4), {}),
+        ((16, 2), {"anchor_lens": "rows", "anchored_window": 8}),
+    ],
+    ids=["gqa4", "anchored"],
+)
+def test_interface_fused_decode_only_for_grouped_shapes(cpu_interface, heads, kwargs):
+    interface, native = cpu_interface(with_fused=True)
+    q, k, v, table, lens = _cpu_inputs(*heads)
+    if kwargs.get("anchor_lens") == "rows":
+        kwargs = {**kwargs, "anchor_lens": torch.zeros(2, dtype=torch.int32)}
+    sinks = torch.zeros(heads[0], dtype=torch.float32)
+    interface.flash_attn_decode_paged(q, k, v, table, lens, sinks=sinks, **kwargs)
+    interface.flash_attn_decode_paged(q, k, v, table, lens)
+    assert [name for name, _ in native.calls] == [
+        "decode_paged_sinks_fwd",
+        "decode_paged_fwd",
+    ]
+
+
+def test_bound_runtime_policy_carries_the_fused_switch(cpu_interface, monkeypatch):
+    interface, _ = cpu_interface(with_fused=True)
+    runtime = importlib.import_module("flash_attn_v100.runtime")
+    fields = runtime.PythonPolicy.__dataclass_fields__
+    assert fields["sink_fused_decode"].default is True
+    # A configured engine's policy wins over the process environment.
+    monkeypatch.setenv(FUSED_ENV, "1")
+    off = SimpleNamespace(policy=SimpleNamespace(sink_fused_decode=False))
+    assert not interface._sink_fused_decode_enabled(_runtime=off)
+    monkeypatch.setenv(FUSED_ENV, "0")
+    on = SimpleNamespace(policy=SimpleNamespace(sink_fused_decode=True))
+    assert interface._sink_fused_decode_enabled(_runtime=on)
+    assert not interface._sink_fused_decode_enabled()
 
 
 @pytest.mark.parametrize(

@@ -765,6 +765,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" AND SM70_TURBOMIND_ARCHS)
   set(VLLM_SM70_SAMPLER_FRAGMENT_SRCS
     "csrc/sm70_turbomind/ops/sm70_top20_philox_fragment.cpp"
     "csrc/sm70_turbomind/ops/sm70_top20_philox_sampler.cu"
+    "csrc/sm70_turbomind/ops/sm70_topk_candidates_sampler.cu"
     "csrc/sm70_turbomind/ops/sm70_sampler_graph_branch.cu")
   set_gencode_flags_for_srcs(
     SRCS "${VLLM_SM70_SAMPLER_FRAGMENT_SRCS}"

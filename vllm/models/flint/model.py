@@ -21,13 +21,15 @@ import regex as re
 import torch
 from torch import nn
 
+from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import CacheConfig, VllmConfig
+from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config_or_none
 from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoE, GateLinear
@@ -55,9 +57,14 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
+from vllm.utils.torch_utils import _encode_layer_name
 
 from .configs import FlintConfig
+from .qk_norm_rope_kv import fused_route_rejection
+
+logger = init_logger(__name__)
 
 _FP16_MAX = torch.finfo(torch.float16).max
 
@@ -294,11 +301,49 @@ class FlintAttention(nn.Module):
             prefix=f"{prefix}.attn",
             sinks=self.softmax_offset,
         )
+        # kernel_config.sm70_flint_qk_rope_kv (VLLM_SM70_FLINT_QK_ROPE_KV),
+        # resolved by VllmConfig; on by default.
+        vllm_config = get_current_vllm_config_or_none()
+        enabled = (
+            vllm_config is None
+            or vllm_config.kernel_config.sm70_flint_qk_rope_kv is not False
+        )
+        is_sm70 = current_platform.is_cuda() and current_platform.is_device_capability(
+            70
+        )
+        reason = fused_route_rejection(
+            enabled=enabled,
+            is_sm70=is_sm70,
+            dtype=torch.get_default_dtype(),
+            head_dim=self.head_dim,
+            q_eps=self.q_norm.variance_epsilon,
+            k_eps=self.k_norm.variance_epsilon,
+            rotary_emb=self.rotary_emb,
+            kv_cache_dtype=self.attn.kv_cache_dtype,
+            attn_type=self.attn.attn_type,
+            calculate_kv_scales=self.attn.calculate_kv_scales,
+            kv_sharing=self.attn.kv_sharing_target_layer_name is not None,
+            backend_writes_kv_in_forward=(
+                self.attn.attn_backend.forward_includes_kv_cache_update
+            ),
+        )
+        # One kernel for the q/k norms, RoPE and the KV-cache write.
+        self.fused_qk_rope_kv = reason is None
+        if self.fused_qk_rope_kv:
+            logger.info_once("Flint SM70: fused q/k norm, RoPE and KV-cache write.")
+        elif is_sm70:
+            logger.info_once(
+                "Flint SM70: separate q/k norm, RoPE and KV-cache write kernels "
+                "because %s.",
+                reason,
+            )
 
     def forward(
         self, positions: torch.Tensor, hidden_states: torch.Tensor
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
+        if self.fused_qk_rope_kv:
+            return self._forward_fused(positions, qkv)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         q_by_head = q.view(*q.shape[:-1], self.num_heads, self.head_dim)
@@ -309,6 +354,28 @@ class FlintAttention(nn.Module):
         if self.rotary_emb is not None:
             q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
+        output, _ = self.o_proj(attn_output)
+        return output
+
+    def _forward_fused(
+        self, positions: torch.Tensor, qkv: torch.Tensor
+    ) -> torch.Tensor:
+        num_tokens = qkv.shape[0]
+        q = torch.empty((num_tokens, self.q_size), dtype=qkv.dtype, device=qkv.device)
+        k = torch.empty((num_tokens, self.kv_size), dtype=qkv.dtype, device=qkv.device)
+        v = qkv[:, self.q_size + self.kv_size :]
+        torch.ops.vllm.qk_norm_rope_kv_cache_update(
+            qkv,
+            q,
+            k,
+            self.q_norm.weight,
+            self.k_norm.weight,
+            positions,
+            None if self.rotary_emb is None else self.rotary_emb.cos_sin_cache,
+            self.q_norm.variance_epsilon,
+            _encode_layer_name(self.attn.layer_name),
+        )
+        attn_output = self.attn(q, k, v, kv_cache_updated=True)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -492,6 +559,12 @@ class FlintForCausalLM(nn.Module, SupportsPP):
         else:
             self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(config.vocab_size)
+        if get_pp_group().is_last_rank and envs.VLLM_SM70_FLINT_SAMPLER:
+            # Vocab-parallel sampling: the runner asks for these per step and
+            # admits them only for the batches they reproduce exactly (pure
+            # greedy; top-k <= 20 random sampling without logprobs).
+            self.get_top_tokens = self._get_top_tokens
+            self.get_topk_candidates = self._get_topk_candidates
         self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
             self.model.make_empty_intermediate_tensors
         )
@@ -510,6 +583,17 @@ class FlintForCausalLM(nn.Module, SupportsPP):
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
+
+    def _get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # Greedy argmax over the regular LM-head logits; the fused SM70
+        # top-1 projection forms FP16 products, too coarse for this head's
+        # folded output scale.
+        return self.logits_processor.get_top_tokens(
+            self.lm_head, hidden_states, fused_top1=False
+        )
+
+    def _get_topk_candidates(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        return self.logits_processor.get_topk_candidates(self.lm_head, hidden_states)
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return _expert_params_mapping(self.config.num_experts)

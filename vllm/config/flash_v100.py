@@ -587,6 +587,7 @@ class FlashV100Options(CapturedFlashOptions):
             "batch_xqa": raw_or("E4M3_BATCH_XQA", "1") == "1",
             "padded_smem": raw_or("XQA_PADDED_SMEM", "1") != "0",
             "dual_cta": raw_or("XQA_G6_DUAL_CTA", "0") == "1",
+            "sink_fused_decode": self.sink_fused_decode,
         }
 
     def hash_values(self):
@@ -604,7 +605,7 @@ class FlashV100Options(CapturedFlashOptions):
                 or self.prefill_d256_gqa_v37
             ):
                 continue
-            if field == "share_decode_workspace":
+            if field in ("share_decode_workspace", "sink_fused_decode"):
                 continue
             if field.startswith("bfla_") and not self.bfla_prefill:
                 continue
@@ -630,7 +631,9 @@ class FlashV100Options(CapturedFlashOptions):
         fields["package"] = {
             field: value
             for field, value in self.python_policy.items()
-            if field != "share_workspace"
+            # Launch-shape choices inside the opaque decode op, like the
+            # shared workspace, do not change compiled graphs.
+            if field not in ("share_workspace", "sink_fused_decode")
             and (
                 field not in ("scalar_fast", "batch_xqa")
                 or self.cache_dtype in ("fp8", "fp8_e4m3")
@@ -856,6 +859,9 @@ class FlashV100Options(CapturedFlashOptions):
     """Retained VLLM_FLASH_V100_E4M3_SCALAR_FAST input."""
     share_decode_workspace: bool | None = None
     """Retained VLLM_FLASH_V100_SHARE_DECODE_WORKSPACE input."""
+    sink_fused_decode: bool | None = None
+    """Retained VLLM_SM70_FLINT_ATTN_FUSED_DECODE input: grouped sink decode in
+    one launch per layer."""
     xqa_staged_pv: bool | None = None
     """Retained VLLM_FLASH_V100_XQA_STAGED_PV input."""
 
@@ -1295,6 +1301,7 @@ class FlashV100Options(CapturedFlashOptions):
             "ne0",
             "1",
         ),
+        "sink_fused_decode": ("VLLM_SM70_FLINT_ATTN_FUSED_DECODE", "ne0", "1"),
         "xqa_staged_pv": ("VLLM_FLASH_V100_XQA_STAGED_PV", "eq1", "0"),
     }
 

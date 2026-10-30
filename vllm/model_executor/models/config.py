@@ -305,9 +305,74 @@ def _flash_v100_sink_route_rejection(vllm_config: "VllmConfig") -> str | None:
     return None
 
 
+def _sm70_tp2_allreduce_add_rms_rejection(vllm_config: "VllmConfig") -> str | None:
+    """Why Flint does not request the TP2 all-reduce + RMSNorm fusion, or None.
+
+    Called only for SM70 deployments. The route needs TP2 without pipeline
+    stages, FP16, hidden size 2048 and the custom all-reduce. Its kill switch
+    (VLLM_SM70_FLINT_AR_RMSNORM, parallel_config.communication.ar_add_rms_tp2)
+    is resolved here, so =0 leaves the pass configuration untouched.
+    """
+    import torch
+
+    from vllm.distributed.device_communicators.collective_provider import (
+        TP2_AR_ADD_RMS_HIDDEN_SIZE,
+    )
+
+    parallel_config = vllm_config.parallel_config
+    if parallel_config.tensor_parallel_size != 2:
+        return f"tensor_parallel_size={parallel_config.tensor_parallel_size}"
+    if parallel_config.pipeline_parallel_size != 1:
+        return f"pipeline_parallel_size={parallel_config.pipeline_parallel_size}"
+    if parallel_config.disable_custom_all_reduce:
+        return "the custom all-reduce is disabled"
+    model_config = vllm_config.model_config
+    if model_config.dtype != torch.float16:
+        return f"dtype={model_config.dtype}"
+    if model_config.get_hidden_size() != TP2_AR_ADD_RMS_HIDDEN_SIZE:
+        return f"hidden_size={model_config.get_hidden_size()}"
+    if vllm_config.compilation_config.pass_config.fuse_allreduce_rms is False:
+        return "fuse_allreduce_rms is disabled"
+    if not parallel_config.communication.early_value("ar_add_rms_tp2"):
+        return "VLLM_SM70_FLINT_AR_RMSNORM=0"
+    return None
+
+
 class FlintModelConfig(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        if not sm70_deployment(vllm_config):
+            return
+        FlintModelConfig._configure_sm70_allreduce_add_rms(vllm_config)
+        FlintModelConfig._select_sm70_attention_backend(vllm_config)
+
+    @staticmethod
+    def _configure_sm70_allreduce_add_rms(vllm_config: "VllmConfig") -> None:
+        """Fuse every hidden-state all-reduce with the norm that follows it.
+
+        On SM70 TP2 each layer boundary runs the custom one-stage all-reduce
+        and then fused_add_rms_norm. The all-reduce + RMSNorm compile pass
+        replaces each pair with one collective whose epilogue does the
+        residual add and the RMSNorm, bitwise equal to the pair.
+        """
+        reason = _sm70_tp2_allreduce_add_rms_rejection(vllm_config)
+        if reason is not None:
+            logger.debug(
+                "Flint on SM70: all-reduce + fused_add_rms_norm fusion is off (%s).",
+                reason,
+            )
+            return
+        pass_config = vllm_config.compilation_config.pass_config
+        pass_config.fuse_allreduce_rms = True
+        pass_config.fuse_allreduce_add_rms_tp2 = True
+        logger.info(
+            "Flint on SM70 TP2: requesting the fusion of each custom all-reduce "
+            "with the residual add and RMSNorm that follow it "
+            "(VLLM_SM70_FLINT_AR_RMSNORM=0 disables)."
+        )
+
+    @staticmethod
+    def _select_sm70_attention_backend(vllm_config: "VllmConfig") -> None:
         """Select an SM70 attention backend that applies the learned sinks.
 
         Every Flint layer has learned attention sinks. On SM70 the platform
@@ -319,7 +384,7 @@ class FlintModelConfig(VerifyAndUpdateConfig):
         instead. An explicitly chosen attention backend is left unchanged.
         """
         attention_config = vllm_config.attention_config
-        if attention_config.backend is not None or not sm70_deployment(vllm_config):
+        if attention_config.backend is not None:
             return
 
         from vllm.v1.attention.backends.registry import AttentionBackendEnum

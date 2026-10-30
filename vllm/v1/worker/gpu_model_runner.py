@@ -7104,15 +7104,20 @@ class GPUModelRunner(
             if logits is None and self._can_use_sm70_compact_topk20_tokens(
                 scheduler_output, spec_decode_metadata
             ):
-                topk_token_ids, topk_logits = self.model.get_topk_tokens_and_logits(
-                    sample_hidden_states,
-                    20,
-                )
-                compact_sampled = self.sampler.sm70_compact_topk20_pairs_sample(
-                    topk_logits,
-                    topk_token_ids,
-                    sampling_metadata,
-                )
+                if hasattr(self.model, "get_topk_candidates"):
+                    compact_sampled = self._sm70_sample_topk_candidates(
+                        sample_hidden_states, sampling_metadata
+                    )
+                else:
+                    topk_token_ids, topk_logits = self.model.get_topk_tokens_and_logits(
+                        sample_hidden_states,
+                        20,
+                    )
+                    compact_sampled = self.sampler.sm70_compact_topk20_pairs_sample(
+                        topk_logits,
+                        topk_token_ids,
+                        sampling_metadata,
+                    )
                 if compact_sampled is not None:
                     logger.info_once(
                         "SM70 TP-local exact top-k20 random sampling path enabled."
@@ -7695,6 +7700,10 @@ class GPUModelRunner(
         scheduler_output: "SchedulerOutput",
         spec_decode_metadata: SpecDecodeMetadata | None,
     ) -> bool:
+        if hasattr(self.model, "get_topk_candidates"):
+            return self._can_use_sm70_topk_candidates(
+                scheduler_output, spec_decode_metadata
+            )
         if not self.vllm_config.kernel_config.layer_execution.value("compact_topk20"):
             return False
         if not self.vllm_config.kernel_config.layer_execution.value("tp_local_topk20"):
@@ -7757,6 +7766,67 @@ class GPUModelRunner(
     def _reject_sm70_compact_topk20_tokens(reason: str) -> bool:
         logger.info_once("SM70 TP-local top-k20 route rejected: %s", reason)
         return False
+
+    def _can_use_sm70_topk_candidates(
+        self,
+        scheduler_output: "SchedulerOutput",
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> bool:
+        """Admit sampling from the model's vocab-parallel top-k candidates."""
+        from vllm.v1.sample.ops import sm70_topk_candidates
+
+        reject = self._reject_sm70_topk_candidates
+        if spec_decode_metadata is not None:
+            return reject("spec_decode")
+        if self.is_pooling_model or self.broadcast_pp_output:
+            return reject("pooling_or_pp_broadcast")
+        if scheduler_output.has_structured_output_requests:
+            return reject("structured_output")
+        if self.device.type != "cuda":
+            return reject("non_cuda")
+        if torch.cuda.get_device_capability(self.device) != (7, 0):
+            return reject("non_sm70")
+        sampling_metadata = self.input_batch.sampling_metadata
+        reason = sm70_topk_candidates.metadata_reject_reason(
+            sampling_metadata, self.input_batch.num_reqs
+        )
+        if reason is not None:
+            return reject(reason)
+        holder = sampling_metadata.thinking_budget_state_holder
+        if holder is not None and holder.has_tracked_requests():
+            return reject("thinking_budget")
+        if not self._non_argmax_logits_processors_inactive(sampling_metadata):
+            return reject("logits_processor")
+        if not self._sm70_argmax_logits_processors_inactive(sampling_metadata):
+            return reject("argmax_invariant_logits_processor")
+        if not sm70_topk_candidates.ops_available():
+            return reject("missing_ops")
+        return True
+
+    @staticmethod
+    def _reject_sm70_topk_candidates(reason: str) -> bool:
+        logger.info_once("SM70 top-k candidate sampler rejected: %s", reason)
+        return False
+
+    def _sm70_sample_topk_candidates(
+        self,
+        sample_hidden_states: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+    ) -> torch.Tensor | None:
+        from vllm.v1.sample.ops import sm70_topk_candidates
+
+        wire = self.model.get_topk_candidates(sample_hidden_states)
+        if wire is None:
+            return None
+        sampled = sm70_topk_candidates.sample_topk_candidates(
+            wire,
+            sampling_metadata,
+            tp_size=get_tp_group().world_size,
+            vocab_size=self.model_config.get_vocab_size(),
+        )
+        if sampled is not None:
+            logger.info_once("SM70 top-k candidate sampler enabled.")
+        return sampled
 
     @staticmethod
     def _sm70_argmax_logits_processors_inactive(

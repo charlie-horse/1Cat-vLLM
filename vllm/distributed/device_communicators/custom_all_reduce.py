@@ -635,6 +635,54 @@ class CustomAllreduce:
             inp, residual, weight, world_size=2, long=False
         )
 
+    def tp2_all_reduce_fused_add_rms_norm(
+        self,
+        inp: torch.Tensor,
+        inp_b: torch.Tensor | None,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        epsilon: float,
+        scale: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """All-reduce ``inp (+ inp_b)``, scale, add ``residual``, RMSNorm.
+
+        Bitwise equal to this communicator's all-reduce followed by
+        ``fused_add_rms_norm``. Callers check
+        :meth:`can_tp2_all_reduce_fused_add_rms_norm` first.
+
+        The kernel stages this rank's input in the communicator's registered
+        buffer and reads the peer's copy there, so the operands need no IPC
+        registration: the same call works eagerly, in graph warmup and
+        under CUDA graph capture, wherever the operands were allocated.
+        """
+        normalized_out = torch.empty_like(inp)
+        residual_out = torch.empty_like(residual)
+        self._native.tp2_all_reduce_fused_add_rms_norm(
+            self._ptr,
+            inp,
+            inp_b,
+            residual,
+            weight,
+            normalized_out,
+            residual_out,
+            self.buffer_ptrs[self.rank],
+            self.max_size,
+            epsilon,
+            scale,
+        )
+        return normalized_out, residual_out
+
+    def can_tp2_all_reduce_fused_add_rms_norm(
+        self,
+        inp: torch.Tensor,
+        inp_b: torch.Tensor | None,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+    ) -> bool:
+        if self.disabled or not self._native.has("tp2_all_reduce_fused_add_rms_norm"):
+            return False
+        return self.capabilities.fused_add_rms_norm_tp2(inp, inp_b, residual, weight)
+
     def sm70_tp4_all_reduce_gemma_rms_norm(
         self,
         inp: torch.Tensor,

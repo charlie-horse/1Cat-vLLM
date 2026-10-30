@@ -624,6 +624,23 @@ class CommunicationPolicy(ExecutionPolicy):
             )
             self.sources["tp8_hierarchical"] = "typed:native"
 
+    def early_value(self, field):
+        """Resolve one aliased field before the engine-wide resolution.
+
+        For config hooks that run before ``resolve``; the later resolution
+        keeps the recorded source and value.
+        """
+        from vllm.config.utils import resolve_legacy_fields
+
+        if field not in self.sources:
+            resolve_legacy_fields(
+                self,
+                {field: self.aliases[field]},
+                reader=type(self).legacy_reader,
+                deferred_errors=self.provider_errors,
+            )
+        return self.value(field)
+
     def compute_hash(self):
         return hash_factors(
             {"policy": super().compute_hash(), "native": self.native.compute_hash()}
@@ -631,6 +648,8 @@ class CommunicationPolicy(ExecutionPolicy):
 
     gemma_rms_tp2: bool | None = None
     """Retain the existing TP2 Gemma all-reduce/RMS fusion qualification."""
+    ar_add_rms_tp2: bool | None = None
+    """Allow the TP2 all-reduce + fused_add_rms_norm fusion a model requests."""
 
     pp_static_hidden_transfer: bool | None = None
     """Retain the metadata-free single-token pipeline transfer contract."""
@@ -694,6 +713,7 @@ class CommunicationPolicy(ExecutionPolicy):
 
     aliases: ClassVar[dict[str, str]] = {
         "gemma_rms_tp2": "VLLM_SM70_TP2_AR_GEMMA_RMS_FUSION",
+        "ar_add_rms_tp2": "VLLM_SM70_FLINT_AR_RMSNORM",
         "pp_static_hidden_transfer": "VLLM_SM70_PP_STATIC_HIDDEN_TRANSFER",
         "moe_sum2_q8": "VLLM_SM70_GLM53_MOE_SUM2_ALLREDUCE_Q8",
         "top1_custom_ar": "VLLM_SM70_TOP1_CUSTOM_AR",
