@@ -31,10 +31,12 @@ context, default sampling, TP2.
 | Single-token NVFP4 GEMV and two-kernel routed experts | ~90 tok/s | Kernel time 5.13 → 1.93 ms/token, **but no e2e change: host-bound** |
 | Borrow engine policies on the decode host path (`0b731f4`) | 118.5 tok/s | Host step time cut; GPU idle gaps closed |
 | Metadata trim (host 1.1–1.7 → 0.75 ms/step, `2f9170d`) | 118.6 tok/s | No change: GPU-bound again; buys slack |
-| Profile-driven GPU round, five of six paths on | 167.7 tok/s | Router, attention grid, q/k-norm+RoPE+KV, sampler. 32K: 153.7 tok/s |
+| Profile-driven GPU round (`2eb8f3b`) | 179.3 tok/s | Fused router, attention grid, q/k-norm+RoPE+KV, sampler, AR+RMSNorm. ITL 8.45 → 5.59 ms; 32K: 165.7 tok/s |
 
-The last row is interim. It is on `claude/flint-gpu-opt`, not on `main`, and
-waits on a greedy ablation and the quality gate.
+Over day two, 4K default decode went 89.5 → 118.5 → 179.3 tok/s, about 2×.
+Greedy now decodes at the same rate (179.5 tok/s), and TTFT did not change
+(0.69 s at 4K, 10.4 s at 32K). The GPU round is recorded in
+[GPU decode fusions](../design/sm70_flint_tp2_pcie.md#gpu-decode-fusions).
 
 Two things cost the most time:
 
@@ -204,8 +206,11 @@ already on the GPUs (`nvidia-smi --query-gpu=index,memory.used`). On Flint,
 - Measure 4K and 32K for the short loop. Run 128K and 250K only at
   milestones: a 250K prefill takes minutes and heats the GPUs into thermal
   slowdown.
-- Report default sampling and greedy separately. Greedy is 0.3–0.5 ms/token
-  faster, so never compare across them.
+- Report default sampling and greedy separately, and never compare across
+  them. Before Flint's fused sampler, greedy was 0.3–0.5 ms/token faster.
+- Expect run-to-run spread from the host CPU clock. One greedy 4K session
+  on the final Flint build gave 167.3, 155 and 146 tok/s; a rerun gave
+  162.4, 167.5 and 167.3.
 
 ### Host vs GPU per step
 
@@ -343,17 +348,22 @@ On `main`:
 | Routed experts, M ≤ 2 | Two-kernel decode (`nvfp4_moe_decode_qpn_sm70.cu`) | `VLLM_SM70_FLINT_MOE_QPN_DECODE` | (see above) |
 | Host | Borrow engine policies (`0b731f4`) | | 4K: ~90 → 118.5 tok/s |
 
-On `claude/flint-gpu-opt` (interim; per-step savings from the microbenchmark
-at M=1):
+The GPU decode fusions (`2eb8f3b`), chosen from a fresh profile of the tip.
+Savings are per step, from the microbenchmark at M=1. All are on by default
+except the MoE persistent kernel. Together they took 4K from 118.6 to
+179.3 tok/s:
 
 | Class | Change | Kill switch | Saving |
 | --- | --- | --- | --- |
-| Router | One fused launch for cast, GEMV, split-K and top-k (20.6 → 8.3 µs/layer) | `VLLM_SM70_FLINT_FUSED_ROUTER` | 0.58 ms |
-| Sampler | Vocab-parallel top-32 candidates (759 → 50 µs) | `VLLM_SM70_FLINT_SAMPLER` | ~0.7 ms (default sampling) |
-| Attention, short context | One launch per layer; grid sized to the live context | `VLLM_SM70_FLINT_ATTN_FUSED_DECODE` | 0.43 ms |
-| q/k norm + RoPE + KV write | One Triton kernel (9.3 → 2.25 µs sliding) | `VLLM_SM70_FLINT_QK_ROPE_KV` | 0.30 ms |
-| All-reduce + add + RMSNorm | Fused into the custom all-reduce | `VLLM_SM70_FLINT_AR_RMSNORM` | 0.25 ms; off: crashed under expandable segments |
+| Sampler | Vocab-parallel top-32 candidates (581–759 → 50 µs GPU) | `VLLM_SM70_FLINT_SAMPLER` | ~0.7 ms (default sampling) |
+| Router | One fused launch for cast, GEMV, split-K and top-k (20.6 → 8.3 µs/layer) | `VLLM_SM70_FLINT_FUSED_ROUTER` | 0.58 ms (0.84 at M=2) |
+| Attention, short context | One launch per layer; grid sized to the live context, not the 262K envelope | `VLLM_SM70_FLINT_ATTN_FUSED_DECODE` | ~0.43 ms at 4K |
+| q/k norm + RoPE + KV write | One Triton kernel (9.3 → 2.25 µs sliding), 130 kernels fewer | `VLLM_SM70_FLINT_QK_ROPE_KV` | ~0.30 ms |
+| All-reduce + add + RMSNorm | Fused through the AR+RMSNorm compile pass | `VLLM_SM70_FLINT_AR_RMSNORM` | ~0.25 ms microbench; e2e ITL 6.00 → 5.59 ms |
 | MoE persistent | W13 and W2 in one kernel | `VLLM_SM70_FLINT_MOE_PERSISTENT` | None; default off |
+
+The fused all-reduce saved more end to end than its microbenchmark
+predicted: removing launches and a sync point matters beyond kernel time.
 
 ### Rules for every change
 
@@ -372,8 +382,13 @@ at M=1):
 3. **Test under real serve conditions.** Run the unit tests with the serve
    script's allocator (`PYTORCH_ALLOC_CONF=expandable_segments:True`),
    buffers allocated before capture, and both PIECEWISE and FULL graph
-   capture. The fused all-reduce passed its tests but crashed the server:
-   `cudaIpcGetMemHandle` fails on expandable-segment memory.
+   capture. The fused all-reduce passed its tests but crashed the server at
+   FULL-graph capture: it registered its operands for peer IPC, and
+   `cudaIpcGetMemHandle` cannot export expandable-segment memory (`invalid
+   argument`). The fix stages inputs into the communicator's peer-readable
+   buffer and registers nothing at capture. It was then qualified on its own
+   (quality probes and greedy with that switch on and off) before it was
+   turned on by default.
 4. **No extra weight copies.** Read the weights the existing route already
    prepared, in place. Use fixed-order reductions, not float atomics, so the
    new path is reproducible.
@@ -397,10 +412,16 @@ attributed in one GPU window:
    across process starts. That spread is the noise floor; judge drift
    against it, not against zero.
 3. Capture once per switch with only that switch off.
-4. At each flip, check the top-2 margin. Near-ties (Flint: margin ≤ 0.31)
-   are FP16 rounding. A flip at a wide margin (Flint had one at 2.23) blocks
-   the merge until a single switch is shown to cause or clear it.
-5. Use prompts shorter than one 16-token KV block when you need exact
+4. At each flip, check the top-2 margin. Near-ties (Flint: margin ≤ 0.34)
+   are FP16 rounding. A flip at a wide margin blocks the merge until it is
+   attributed.
+5. To attribute a wide flip, run the controls: the new tree with **every**
+   switch off, and the old baseline in a fresh process. Flint had one flip
+   at margin 2.23 against the previous build. With all six switches off, the
+   new tree reproduced it at the same token and margin, so it came from
+   server-start variance (TurboMind's live tactic timing, plus the `main`
+   merge), not from the new paths. Within one server start, greedy repeats.
+6. Use prompts shorter than one 16-token KV block when you need exact
    repeats. Longer prompts that hit the prefix cache drift by about 1e-3 nats
    even on one build.
 
@@ -438,6 +459,9 @@ The reference host runs NixOS; the flake lives at `/etc/nixos`, outside git
 - **Build, then switch.** As your user: `nixos-rebuild build --flake
   /etc/nixos#c4130 --cores 16 --max-jobs 1`. Then `sudo nixos-rebuild
   switch`, after the RAM guard is running.
+- **Compile cache.** A deploy that changes compile passes (Flint: the
+  AR+RMSNorm fusion) invalidates the torch.compile cache once. Expect the
+  first start after it to take longer, and don't mistake that for a hang.
 
 ### RAM guard
 
@@ -535,6 +559,10 @@ vllm-lmcache vllm`, then wait about 3 minutes for `/v1/models`.
 - A rule of "exactly two e2e measurements" was too strict once a result
   surprised. Allow a same-tree A/B with kill switches whenever a number
   needs explaining.
+- End each push with a retrospective. One session interviewed the
+  coordinator and the GPU session, checked their answers against the design
+  doc and git, and wrote this playbook. Batched questions cost each session
+  one reply.
 - After deleting upstream CI or docs from the fork, re-run the architecture
   hooks and markdownlint, and check Docker `COPY` lines and `setup.py`
   requirement reads. All of them broke silently.
@@ -601,7 +629,8 @@ Phase 3, optimize (per change):
 Phase 4, validate:
 
 - [ ] Greedy: old path twice, new path, one run per switch off
-- [ ] Every flip at a near-tie, or attributed to one switch
+- [ ] Every flip at a near-tie, or attributed with an all-switches-off
+      control
 - [ ] Quality probes pass
 
 Phases 5 and 6, deploy and coordinate:
