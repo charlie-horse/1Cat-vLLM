@@ -766,15 +766,122 @@ Correctness:
   decode paths give one result every time.
 - Quality probes: math 10/10, code 5/5, needle at 32K 3/3.
 
+### GPU decode fusions
+
+With the GEMVs in place, the step went back to the GPU. Rank 1 at 4K on
+`5fc02fa` (torch profiler, ms per step): the graph is busy 6.96 ms of an
+8.06 ms span, eager kernels take 0.85 ms and the GPU is idle 1.25 ms, for a
+9.05 ms step. The largest pieces:
+
+| Component | ms/step |
+| --- | ---: |
+| Router: fp32 cast 0.31, cuBLAS GEMV 0.41, split-K 0.14, topkGating 0.46 | 1.32 |
+| Attention: partition kernel 1.43, reduce 0.21 | 1.64 |
+| Dense GEMVs | 1.37 |
+| All-reduce, 99 x 11 us | 1.09 |
+| Routed experts | 0.96 |
+| RMSNorm: q/k 98 x 3.5 us, fused add 98 x 3.5 us | 0.69 |
+| lm_head, eager | 0.41 |
+
+The eager sampler also runs two full-vocab fp32 softmaxes, 98 us each. The
+changes below each have a `VLLM_SM70_FLINT_*` kill switch, read at load and
+on by default unless noted.
+
+1. **Fused router** (`VLLM_SM70_FLINT_FUSED_ROUTER`). For 1-2 tokens, one
+   launch per MoE layer replaces the fp32 cast, the cuBLAS GEMV, the split-K
+   reduce and topkGating. It reads fp16 activations and the FP32 gate as
+   loaded, accumulates in FP32 and keeps the sigmoid top-6 tie-breaking.
+   20.61 -> 8.32 us per layer at M=1 (25.60 -> 7.81 at M=2), 0.58 ms per
+   step (0.84 at M=2). On real weights (layers 10-48, 2,000 vectors per
+   distribution) there are no hard flips and the largest weight error is
+   4.2e-7; one near-tie flips on layer 40.
+2. **One-launch grouped sink decode** (`VLLM_SM70_FLINT_ATTN_FUSED_DECODE`).
+   The partition grid was sized for the 262K capture envelope, so at 4K
+   almost every CTA exited at once. The new kernel fixes about 80 CTAs per
+   KV head by launch shape, chunks the window on the device (64-256 tokens)
+   and lets the last CTA combine the partials in index order and apply the
+   sinks. About 0.43 ms per step at 4K; 200 decode-sink tests pass.
+3. **q/k RMSNorm, RoPE and KV-cache write in one Triton kernel**
+   (`VLLM_SM70_FLINT_QK_ROPE_KV`). 2.25-2.5 us per layer against 9.3-10.3
+   (sliding, with RoPE) and 6.2-6.9 (full): about 0.3 ms and 130 kernels
+   fewer per step. It also runs in prefill. The cache layout is
+   bit-identical; q and k are within 1 fp16 ulp.
+4. **Vocab-parallel candidate sampler** (`VLLM_SM70_FLINT_SAMPLER`). Each
+   rank takes its top 32 fp16 logits and the ranks all-gather 256 B per row.
+   One kernel then applies temperature, top-k (ties at the k-th value kept),
+   top-p in the reference order and the exponential-race draw with the same
+   Philox offsets. GPU time per step drops from 581-759 to 50 us at batch 1
+   (1,449-1,846 to 48 at batch 2). Greedy keeps the argmax path.
+5. **Single-launch routed-expert decode** (`VLLM_SM70_FLINT_MOE_PERSISTENT`,
+   off). Bitwise equal to the two kernels but not faster: 18.44 -> 19.07 us
+   at M=1, 27.52 -> 27.39 at M=2. Likely cause: 80 registers x 384 threads
+   allow 24 warps per SM in W13 instead of 32, and W2 blocks start only
+   after every W13 block is dispatched.
+6. **All-reduce fused with residual add and RMSNorm**
+   (`VLLM_SM70_FLINT_AR_RMSNORM`, off in this release), through the
+   all-reduce + RMSNorm compile pass. Bitwise equal. The microbenchmark
+   saves 1.71 us per boundary at 1 row (3.47 on MoE boundaries, where it
+   also absorbs the shared + routed expert add), 0.90 / 2.76 at 2 rows. The
+   first version crashed the server at FULL-graph capture: it registered its
+   expert-output operands for peer IPC, which expandable segments cannot
+   export (`cudaIpcGetMemHandle: invalid argument`). It now stages its
+   inputs into the communicator's peer-readable buffer and registers nothing
+   at capture. End-to-end validation of this path is pending.
+
+Per-layer attention, two launches -> fused, us:
+
+| Layer | 4K | 32K | 128K | 250K |
+| --- | ---: | ---: | ---: | ---: |
+| Full | 25.3 -> 18.8 | 75.6 -> 70.1 | 249.2 -> 230.9 | 459.6 -> 421.4 |
+| Sliding 512 | 22.8 -> 13.0 | | | 29.5 -> 13.1 |
+
+The sampler is admitted for batch 1-2, all-random requests, top-k <= 20 and
+no logprobs, penalties, logits processors, speculative decoding or
+structured output; seeded requests only at batch 1. If more than 32 logits
+on one rank tie at or above the k-th value, the extra ties cannot be
+sampled. A device counter records that and the server logs a warning; no
+serving run has hit it.
+
+End to end (single stream, random-token prompts, 256 tokens, median of 3).
+Before is `5fc02fa`; after is `claude/flint-gpu-opt` with `main` merged, including the
+host-metadata fix `2f9170d`, with switches 5 and 6 off:
+
+| Context, sampling | Before | After | ITL before / after |
+| --- | ---: | ---: | ---: |
+| 4K, default | 118.6 tok/s | **166.4-167.7 tok/s** | 8.45 / 6.00 ms |
+| 4K, greedy | 124.1 tok/s | **167.3 tok/s** | 8.09 / 6.00 ms |
+| 32K, default | 112.9 tok/s | **155.5 tok/s** | 9.06 / 6.64 ms |
+| 32K, greedy | 118.2 tok/s | **155.1 tok/s** | 8.69 / 6.65 ms |
+
+That is +40% (default) and +35% (greedy) at 4K, +38% and +31% at 32K.
+Default and greedy now decode at the same rate. TTFT does not change
+(0.68 s at 4K, 10.3 s at 32K). Runs still vary with the host CPU clock: one
+greedy 4K session gave 167.3 / 155 / 146 tok/s, a rerun 162.4 / 167.5 /
+167.3.
+
+Quality:
+
+- Probes: math 10/10, code 5/5, needle at 32K 3/3 (depths 0.1, 0.5, 0.9).
+  The "two greedy runs differ" warning shows up as on the baseline.
+- Greedy (9 prompts x 128 tokens) against the old paths in the same tree:
+  6 of 9 identical; the flips are near-ties (top-2 margins 0.0098, 0.066,
+  0.198).
+- A flip at margin 2.23 against `5fc02fa` does not come from these paths:
+  with all six switches off the new tree reproduces it at the same token
+  and margin. It comes from server-start variance (TurboMind's live tactic
+  timing at M <= 64, which moves the short prompts, and the `main` merge).
+  Within one server start, greedy repeats.
+
 ### Remaining ideas, by expected gain
 
-1. **TurboMind M=1 GEMVs.** Done; see
-   [Single-token NVFP4 GEMV](#single-token-nvfp4-gemv). What is left there,
-   by expected gain: host-side attention metadata (about 1 ms per KV-cache
-   group per step, now within about 2 ms of the GPU time); one persistent
-   kernel for the routed experts, so W2 loads while W13 runs (about 3-5 us
-   per layer); and reproducible TurboMind tactic selection (shared LUT
-   across ranks, warm-up for prefill lengths 3-15).
+Done since the first version of this list: the TurboMind M=1 GEMVs (see
+[Single-token NVFP4 GEMV](#single-token-nvfp4-gemv)), the host-side
+attention metadata (`2f9170d`), the fused router and the vocab-parallel
+sampler (see [GPU decode fusions](#gpu-decode-fusions)). The persistent
+routed-expert kernel was built and is no faster.
+
+1. **All-reduce + RMSNorm.** About 0.25 ms per step. The path is built
+   (switch 6 above); it needs end-to-end validation, then default on.
 2. **Prefill.** The largest cost of a long request: TTFT is 10.4 s at 32K,
    113 s at 128K and 398 s at 250K, against 3-11 s of decode for 256
    tokens. At 250K it also heats GPU 1 into thermal slowdown for the decode
@@ -782,19 +889,23 @@ Correctness:
    (split-KV, dense, small-query). The D128 paged prefill with sinks could
    get a grouped-query, split-KV path, as decode now has.
 3. **Long-context attention.** About 10% at 128K and 15% at 250K. The v3
-   kernel reaches about 510 GB/s at 128K; the 14 full layers still take
-   3.7 ms per token there and 6.7 ms at 250K. More loads in flight, a
-   two-stage K/V prefetch, or context-bucketed graphs with a smaller launch
-   envelope could bring it closer to 800 GB/s.
-4. **Fused router.** About 5%. An fp16-input, fp32-weight GEMV plus the
-   sigmoid top-6 in one or two kernels would save about 0.5-0.9 ms per
-   token, at the cost of a different fp32 summation order.
-5. **Speculative decoding.** n-gram or suffix drafts for agent workloads.
+   kernel reaches about 510 GB/s at 128K; the 14 full layers took 3.7 ms
+   per token there and 6.7 ms at 250K, and the one-launch kernel trims only
+   7-8% of that. More loads in flight or a two-stage K/V prefetch could
+   bring it closer to 800 GB/s.
+4. **Host time.** The step ITL is now 6.0 ms at 4K. Whether host work is
+   again close to the GPU time has not been measured since the fusions;
+   profile both before the next GPU change.
+5. **Reproducible TurboMind tactic selection.** Now the main source of
+   greedy drift across server starts: a shared LUT across ranks and warm-up
+   for prefill lengths 3-15.
+6. **Single-launch routed-expert decode.** Fit three blocks per SM
+   (<= 56 registers) so W13 keeps 32 warps, or drop the kernel.
+7. **Dense GEMVs.** Close to the floor measured above; little is left.
+8. **Speculative decoding.** n-gram or suffix drafts for agent workloads.
    The sink path rejects speculative configs today. The D128 verify path
    goes through the same scalar sink-aware decode kernel and would need the
    grouped kernel and a GPU check of verify correctness with sinks first.
-6. **Sampler.** About 3%. Apply top-k 20 before top-p to avoid sorting the
-   full vocab.
 
 ## Known limits
 
