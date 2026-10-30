@@ -33,6 +33,9 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoE, GateLinear
+from vllm.model_executor.layers.fused_moe.router.sm70_flint_router import (
+    admit_flint_fused_router,
+)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
@@ -221,6 +224,9 @@ class FlintSparseMoeBlock(nn.Module):
             prefix=f"{prefix}.experts",
             expert_mapping=_expert_params_mapping(config.num_experts),
         )
+        # The provider admits the fused gate + top-k decode router (device,
+        # layout, kill switch) on the layer's first eager forward.
+        self.experts.runner.router_provider = admit_flint_fused_router
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # The gate runs inside FusedMoE (after the shared-expert stream sync).

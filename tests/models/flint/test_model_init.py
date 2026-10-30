@@ -284,6 +284,9 @@ def test_registered_architecture():
 
 def test_layer_layout(dist, cpu_layers):
     from vllm.model_executor.layers.fused_moe import FusedMoE
+    from vllm.model_executor.layers.fused_moe.router.sm70_flint_router import (
+        admit_flint_fused_router,
+    )
     from vllm.models.flint.model import FlintMLP, FlintSparseMoeBlock
 
     cfg = tiny_config()
@@ -323,6 +326,9 @@ def test_layer_layout(dist, cpu_layers):
         assert experts.is_internal_router
         assert experts.shared_experts is not None
         assert experts.moe_config.router_logits_dtype == torch.float32
+        # The fused decode router is bound here and admitted on first use.
+        assert experts.runner.router_provider is admit_flint_fused_router
+        assert not experts.runner._precomputed_route_decided
         gate = layer.mlp.gate
         assert gate.weight.dtype == torch.float32
         assert gate.out_dtype == torch.float32

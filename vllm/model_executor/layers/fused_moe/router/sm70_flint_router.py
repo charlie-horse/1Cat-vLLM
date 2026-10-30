@@ -11,6 +11,8 @@ renormalized sigmoid top six in the same launch, with ``topk_sigmoid``'s
 scoring, tie-breaking and normalization. Only the FP32 summation order of the
 logits differs.
 
+The model adapter binds ``admit_flint_fused_router`` as the layer's
+``MoERunner.router_provider``; the runner calls it on the first eager forward.
 Admission is decided once per layer from its configuration (gate, router,
 parallel layout, kill switch ``VLLM_SM70_FLINT_FUSED_ROUTER``); each call then
 checks only tensor metadata (one or two FP16 rows), which is fixed for a

@@ -196,3 +196,32 @@ def test_try_route_defers_to_generic_route(admitted):
     runner.router.indices_type_getter = lambda: torch.int32
     assert state.try_route(x) is not None
     assert len(admitted) == 2
+
+
+def test_runner_hook_admits_once_outside_capture(admitted, monkeypatch):
+    from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+
+    hook = MoERunner._maybe_precomputed_route
+    x = torch.zeros(1, 2048, dtype=torch.float16)
+    runner = make_runner(
+        router_provider=None,
+        _precomputed_route=None,
+        _precomputed_route_decided=False,
+    )
+    # Unbound layers (every other model) keep the gate route untouched.
+    assert hook(runner, x) is None and not runner._precomputed_route_decided
+
+    calls = []
+
+    def provider(layer):
+        calls.append(layer)
+        return mod.admit_flint_fused_router(layer)
+
+    runner.router_provider = provider
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    assert hook(runner, x) is None and not calls
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    weights, ids = hook(runner, x)
+    assert weights.shape == ids.shape == (1, 6)
+    assert hook(runner, x) is not None
+    assert calls == [runner] and len(admitted) == 2

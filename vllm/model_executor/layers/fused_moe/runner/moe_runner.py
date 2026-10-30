@@ -2,13 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable
 from contextlib import nullcontext
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 import torch
 import torch.nn.functional as F
 
 from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
-from vllm.config.diagnostic_dump import parse_int_filter
 from vllm.config.execution_policy import communication_policy, graph_policy
 from vllm.config.sm70_runtime import capture_runtime_trace
 from vllm.diagnostics import (
@@ -39,10 +38,6 @@ from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
 from vllm.model_executor.layers.fused_moe.router.fused_moe_router import (
     FusedMoERouter,
 )
-from vllm.model_executor.layers.fused_moe.router.sm70_flint_router import (
-    FlintFusedRouter,
-    admit_flint_fused_router,
-)
 from vllm.model_executor.layers.fused_moe.router.zero_expert_router import (
     ZeroExpertRouter,
 )
@@ -63,11 +58,6 @@ from vllm.utils.torch_utils import (
 logger = init_logger(__name__)
 _SM70_MOE_RUNNER_DUMP_BUFFERS = legacy_channel("moe_runner").buffers
 _SM70_MOE_RUNNER_DUMP_META = legacy_channel("moe_runner").metadata
-
-
-def _sm70_parse_int_ranges(raw_ranges: str | None) -> set[int] | None:
-    selected = parse_int_filter(raw_ranges)
-    return None if selected is None else set(selected)
 
 
 def _sm70_extract_moe_layer_idx(layer_name: str) -> int:
@@ -274,6 +264,20 @@ def _unpack(
         return (None, result)
 
 
+class PrecomputedRoute(Protocol):
+    """Per-layer routing state that may replace the gate and select_experts."""
+
+    def try_route(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Top-k weights and ids, or None to take the gate + select_experts."""
+        ...
+
+
+# Binds a layer's PrecomputedRoute, or None when the layer is not admitted.
+RouterProvider = Callable[["MoERunner"], PrecomputedRoute | None]
+
+
 class MoERunner(MoERunnerInterface):
     """
     Standard MoE runner implementation for executing Mixture of Experts layers.
@@ -360,9 +364,11 @@ class MoERunner(MoERunnerInterface):
                 attach_route_recorder(self.router, layer_name, parameter.device)
 
         self._forward_entry = self._select_forward()
-        # Fused E256/K6 decode router: per-layer state once admitted.
-        self._flint_fused_router: FlintFusedRouter | None = None
-        self._flint_fused_router_decided = False
+        # Optional router provider, bound by a model adapter or provider at
+        # construction; its per-layer state is decided on the first eager call.
+        self.router_provider: RouterProvider | None = None
+        self._precomputed_route: PrecomputedRoute | None = None
+        self._precomputed_route_decided = False
 
     def _select_forward(self) -> Callable:
         if current_platform.is_tpu() or current_platform.is_cpu():
@@ -404,23 +410,25 @@ class MoERunner(MoERunnerInterface):
     def is_internal_router(self) -> bool:
         return self.gate is not None
 
-    def _maybe_flint_fused_route(
+    def _maybe_precomputed_route(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        """Gate and top-k in one kernel for one or two tokens.
+        """Top-k from the bound router provider, or None for the gate route.
 
         Admission is decided once per layer, outside graph capture; each call
         checks tensor metadata only, so a captured graph has no data branch.
         """
-        if not self._flint_fused_router_decided:
-            if torch.cuda.is_current_stream_capturing():
-                # The workspace must not come from a graph pool.
-                return None
-            self._flint_fused_router = admit_flint_fused_router(self)
-            self._flint_fused_router_decided = True
-        if self._flint_fused_router is None:
+        if self.router_provider is None:
             return None
-        return self._flint_fused_router.try_route(hidden_states)
+        if not self._precomputed_route_decided:
+            if torch.cuda.is_current_stream_capturing():
+                # Provider state must not come from a graph pool.
+                return None
+            self._precomputed_route = self.router_provider(self)
+            self._precomputed_route_decided = True
+        if self._precomputed_route is None:
+            return None
+        return self._precomputed_route.try_route(hidden_states)
 
     def apply_routed_input_transform(
         self, hidden_states: torch.Tensor
@@ -1047,7 +1055,7 @@ class MoERunner(MoERunnerInterface):
         # so it can run overlapped with the
         # NOTE: in future PR, MoE runner will always hold the gate.
         precomputed_topk = (
-            self._maybe_flint_fused_route(hidden_states)
+            self._maybe_precomputed_route(hidden_states)
             if self.gate is not None
             else None
         )
